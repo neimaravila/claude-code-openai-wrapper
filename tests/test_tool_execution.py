@@ -93,7 +93,7 @@ class TestParseClaudeMessage:
         result = cli.parse_claude_message(messages)
 
         # Should return the ResultMessage.result, not the first AssistantMessage
-        assert result == "The files are:\n1. file1.txt\n2. file2.txt\n3. file3.txt"
+        assert result.text == "The files are:\n1. file1.txt\n2. file2.txt\n3. file3.txt"
 
     def test_fallback_to_last_assistant_message(self):
         """Test fallback to last AssistantMessage when no ResultMessage."""
@@ -114,7 +114,7 @@ class TestParseClaudeMessage:
         result = cli.parse_claude_message(messages)
 
         # Should return the LAST text, not the first
-        assert result == "Second response"
+        assert result.text == "Second response"
 
     def test_handles_empty_messages(self):
         """Test handling of empty message list."""
@@ -123,7 +123,7 @@ class TestParseClaudeMessage:
         cli = ClaudeCodeCLI(cwd="/tmp")
 
         result = cli.parse_claude_message([])
-        assert result is None
+        assert result.text is None
 
     def test_handles_dict_content_blocks(self):
         """Test handling of dict-based content blocks (old format)."""
@@ -134,7 +134,7 @@ class TestParseClaudeMessage:
         messages = [{"content": [{"type": "text", "text": "Hello world"}]}]
 
         result = cli.parse_claude_message(messages)
-        assert result == "Hello world"
+        assert result.text == "Hello world"
 
 
 class TestClaudeCliPermissionMode:

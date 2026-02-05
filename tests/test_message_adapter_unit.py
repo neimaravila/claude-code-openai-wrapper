@@ -252,6 +252,33 @@ class TestFilterContent:
 
         assert "How can I help you today?" in result
 
+    def test_preserve_thinking_keeps_thinking_blocks(self):
+        """With preserve_thinking=True, thinking blocks are kept."""
+        content = "<thinking>My reasoning</thinking>Here is my answer."
+        result = MessageAdapter.filter_content(content, preserve_thinking=True)
+
+        assert "<thinking>" in result
+        assert "My reasoning" in result
+        assert "Here is my answer" in result
+
+    def test_preserve_thinking_false_removes_thinking_blocks(self):
+        """With preserve_thinking=False (default), thinking blocks are removed."""
+        content = "<thinking>My reasoning</thinking>Here is my answer."
+        result = MessageAdapter.filter_content(content, preserve_thinking=False)
+
+        assert "<thinking>" not in result
+        assert "My reasoning" not in result
+        assert "Here is my answer" in result
+
+    def test_preserve_thinking_still_removes_tool_blocks(self):
+        """With preserve_thinking=True, tool blocks are still removed."""
+        content = "<thinking>reason</thinking>Text <bash>ls</bash> more text"
+        result = MessageAdapter.filter_content(content, preserve_thinking=True)
+
+        assert "<thinking>" in result
+        assert "<bash>" not in result
+        assert "ls" not in result
+
 
 class TestFormatClaudeResponse:
     """Test MessageAdapter.format_claude_response()"""

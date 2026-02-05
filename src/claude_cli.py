@@ -2,6 +2,7 @@ import os
 import tempfile
 import atexit
 import shutil
+from dataclasses import dataclass
 from typing import AsyncGenerator, Dict, Any, Optional, List
 from pathlib import Path
 import logging
@@ -9,6 +10,14 @@ import logging
 from claude_agent_sdk import query, ClaudeAgentOptions
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ParsedMessage:
+    """Parsed result from Claude Agent SDK messages."""
+
+    text: Optional[str] = None
+    reasoning: Optional[str] = None
 
 
 class ClaudeCodeCLI:
@@ -104,6 +113,7 @@ class ClaudeCodeCLI:
         session_id: Optional[str] = None,
         continue_session: bool = False,
         permission_mode: Optional[str] = None,
+        max_thinking_tokens: Optional[int] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Run Claude Agent using the Python SDK and yield response chunks."""
 
@@ -140,6 +150,10 @@ class ClaudeCodeCLI:
                 # Set permission mode (needed for tool execution in API context)
                 if permission_mode:
                     options.permission_mode = permission_mode
+
+                # Set max thinking tokens for extended thinking / reasoning
+                if max_thinking_tokens is not None:
+                    options.max_thinking_tokens = max_thinking_tokens
 
                 # Handle session continuity
                 if continue_session:
@@ -192,27 +206,35 @@ class ClaudeCodeCLI:
                 "error_message": str(e),
             }
 
-    def parse_claude_message(self, messages: List[Dict[str, Any]]) -> Optional[str]:
+    def parse_claude_message(self, messages: List[Dict[str, Any]]) -> ParsedMessage:
         """Extract the assistant message from Claude Agent SDK messages.
 
         Prioritizes ResultMessage.result for multi-turn conversations,
         falls back to last AssistantMessage content.
+
+        Returns a ParsedMessage with text and optional reasoning content.
         """
         # First, check for ResultMessage with 'result' field (multi-turn completion)
         for message in messages:
             if message.get("subtype") == "success" and "result" in message:
-                return message["result"]
+                return ParsedMessage(text=message["result"])
 
-        # Collect all text from AssistantMessages (take the last one with text)
+        # Collect all text and reasoning from AssistantMessages (take the last one)
         last_text = None
+        reasoning_parts = []
         for message in messages:
             # Look for AssistantMessage type (new SDK format)
             if "content" in message and isinstance(message["content"], list):
                 text_parts = []
                 for block in message["content"]:
+                    # Handle ThinkingBlock objects (extended thinking)
+                    if hasattr(block, "thinking"):
+                        reasoning_parts.append(block.thinking)
                     # Handle TextBlock objects
-                    if hasattr(block, "text"):
+                    elif hasattr(block, "text"):
                         text_parts.append(block.text)
+                    elif isinstance(block, dict) and block.get("type") == "thinking":
+                        reasoning_parts.append(block.get("thinking", ""))
                     elif isinstance(block, dict) and block.get("type") == "text":
                         text_parts.append(block.get("text", ""))
                     elif isinstance(block, str):
@@ -232,12 +254,15 @@ class ClaudeCodeCLI:
                         for block in content:
                             if isinstance(block, dict) and block.get("type") == "text":
                                 text_parts.append(block.get("text", ""))
+                            elif isinstance(block, dict) and block.get("type") == "thinking":
+                                reasoning_parts.append(block.get("thinking", ""))
                         if text_parts:
                             last_text = "\n".join(text_parts)
                     elif isinstance(content, str):
                         last_text = content
 
-        return last_text
+        reasoning = "\n".join(reasoning_parts) if reasoning_parts else None
+        return ParsedMessage(text=last_text, reasoning=reasoning)
 
     def extract_metadata(self, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Extract metadata like costs, tokens, and session info from SDK messages."""

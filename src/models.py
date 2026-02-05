@@ -26,6 +26,12 @@ class Message(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: Union[str, List[ContentPart]]
     name: Optional[str] = None
+    reasoning_content: Optional[str] = None
+
+    def model_dump(self, **kwargs):
+        """Override to exclude None fields by default for clean JSON output."""
+        kwargs.setdefault("exclude_none", True)
+        return super().model_dump(**kwargs)
 
     @model_validator(mode="after")
     def normalize_content(self):
@@ -76,6 +82,10 @@ class ChatCompletionRequest(BaseModel):
         default=False,
         description="Enable Claude Code tools (Read, Write, Bash, etc.) - disabled by default for OpenAI compatibility",
     )
+    reasoning_effort: Optional[Literal["low", "medium", "high"]] = Field(
+        default=None,
+        description="Reasoning effort level that maps to Claude's max_thinking_tokens",
+    )
     stream_options: Optional[StreamOptions] = Field(
         default=None, description="Options for streaming responses"
     )
@@ -104,10 +114,9 @@ class ChatCompletionRequest(BaseModel):
                 f"top_p={self.top_p} will be applied via system prompt (best-effort)"
             )
 
-        if self.max_tokens is not None or self.max_completion_tokens is not None:
-            max_val = self.max_completion_tokens or self.max_tokens
+        if self.reasoning_effort is not None:
             info_messages.append(
-                f"max_tokens={max_val} will be mapped to max_thinking_tokens (best-effort)"
+                f"reasoning_effort={self.reasoning_effort} will be mapped to max_thinking_tokens"
             )
 
         if self.presence_penalty != 0:
@@ -172,6 +181,8 @@ class ChatCompletionRequest(BaseModel):
 
     def to_claude_options(self) -> Dict[str, Any]:
         """Convert OpenAI request parameters to Claude Code SDK options."""
+        from src.constants import REASONING_EFFORT_MAP
+
         # Log parameter handling information
         self.log_parameter_info()
 
@@ -181,14 +192,12 @@ class ChatCompletionRequest(BaseModel):
         if self.model:
             options["model"] = self.model
 
-        # Map max_tokens to max_thinking_tokens (best effort)
-        max_token_value = self.max_completion_tokens or self.max_tokens
-        if max_token_value is not None:
-            # Claude SDK doesn't have exact token limiting, but we can try max_thinking_tokens
-            # This is approximate and may not work as expected
-            options["max_thinking_tokens"] = max_token_value
+        # Map reasoning_effort to max_thinking_tokens
+        if self.reasoning_effort is not None:
+            options["max_thinking_tokens"] = REASONING_EFFORT_MAP[self.reasoning_effort]
             logger.info(
-                f"Mapped max_tokens={max_token_value} to max_thinking_tokens (approximate behavior)"
+                f"Mapped reasoning_effort={self.reasoning_effort} to "
+                f"max_thinking_tokens={options['max_thinking_tokens']}"
             )
 
         # Use user field for session identification if provided

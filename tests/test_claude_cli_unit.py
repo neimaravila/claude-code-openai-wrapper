@@ -32,7 +32,8 @@ class TestClaudeCodeCLIParseMessage:
 
         messages = [{"subtype": "success", "result": "The final answer is 42."}]
         result = cli.parse_claude_message(messages)
-        assert result == "The final answer is 42."
+        assert result.text == "The final answer is 42."
+        assert result.reasoning is None
 
     def test_parse_assistant_message_with_content_list(self, cli_class):
         """Parses assistant message with content list."""
@@ -48,7 +49,7 @@ class TestClaudeCodeCLIParseMessage:
             }
         ]
         result = cli.parse_claude_message(messages)
-        assert result == "Hello \nWorld!"
+        assert result.text == "Hello \nWorld!"
 
     def test_parse_assistant_message_with_textblock_objects(self, cli_class):
         """Parses assistant message with TextBlock objects."""
@@ -58,10 +59,12 @@ class TestClaudeCodeCLIParseMessage:
         # Mock TextBlock object
         text_block = MagicMock()
         text_block.text = "Response text"
+        # Ensure no 'thinking' attribute
+        del text_block.thinking
 
         messages = [{"content": [text_block]}]
         result = cli.parse_claude_message(messages)
-        assert result == "Response text"
+        assert result.text == "Response text"
 
     def test_parse_assistant_message_with_string_content(self, cli_class):
         """Parses assistant message with string content blocks."""
@@ -70,7 +73,7 @@ class TestClaudeCodeCLIParseMessage:
 
         messages = [{"content": ["Part 1", "Part 2"]}]
         result = cli.parse_claude_message(messages)
-        assert result == "Part 1\nPart 2"
+        assert result.text == "Part 1\nPart 2"
 
     def test_parse_old_format_assistant_message(self, cli_class):
         """Parses old format assistant message."""
@@ -84,7 +87,7 @@ class TestClaudeCodeCLIParseMessage:
             }
         ]
         result = cli.parse_claude_message(messages)
-        assert result == "Old format response"
+        assert result.text == "Old format response"
 
     def test_parse_old_format_string_content(self, cli_class):
         """Parses old format with string content."""
@@ -98,24 +101,25 @@ class TestClaudeCodeCLIParseMessage:
             }
         ]
         result = cli.parse_claude_message(messages)
-        assert result == "Simple string content"
+        assert result.text == "Simple string content"
 
-    def test_parse_empty_messages_returns_none(self, cli_class):
-        """Empty messages list returns None."""
+    def test_parse_empty_messages_returns_none_text(self, cli_class):
+        """Empty messages list returns ParsedMessage with None text."""
         cli = MagicMock()
         cli.parse_claude_message = cli_class.parse_claude_message.__get__(cli, cli_class)
 
         result = cli.parse_claude_message([])
-        assert result is None
+        assert result.text is None
+        assert result.reasoning is None
 
-    def test_parse_no_matching_messages_returns_none(self, cli_class):
-        """No matching messages returns None."""
+    def test_parse_no_matching_messages_returns_none_text(self, cli_class):
+        """No matching messages returns ParsedMessage with None text."""
         cli = MagicMock()
         cli.parse_claude_message = cli_class.parse_claude_message.__get__(cli, cli_class)
 
         messages = [{"type": "system", "content": "System message"}]
         result = cli.parse_claude_message(messages)
-        assert result is None
+        assert result.text is None
 
     def test_parse_uses_last_text(self, cli_class):
         """When multiple messages, uses the last one with text."""
@@ -127,7 +131,7 @@ class TestClaudeCodeCLIParseMessage:
             {"content": [{"type": "text", "text": "Second response"}]},
         ]
         result = cli.parse_claude_message(messages)
-        assert result == "Second response"
+        assert result.text == "Second response"
 
     def test_result_takes_priority(self, cli_class):
         """ResultMessage.result takes priority over AssistantMessage."""
@@ -139,7 +143,72 @@ class TestClaudeCodeCLIParseMessage:
             {"subtype": "success", "result": "Final result"},
         ]
         result = cli.parse_claude_message(messages)
-        assert result == "Final result"
+        assert result.text == "Final result"
+
+    def test_parse_thinking_block_objects(self, cli_class):
+        """Parses ThinkingBlock objects into reasoning field."""
+        cli = MagicMock()
+        cli.parse_claude_message = cli_class.parse_claude_message.__get__(cli, cli_class)
+
+        # Mock ThinkingBlock object
+        thinking_block = MagicMock()
+        thinking_block.thinking = "Let me reason about this..."
+        # Remove text attr to avoid matching TextBlock check
+        del thinking_block.text
+
+        text_block = MagicMock()
+        text_block.text = "The answer is 42."
+        del text_block.thinking
+
+        messages = [{"content": [thinking_block, text_block]}]
+        result = cli.parse_claude_message(messages)
+        assert result.text == "The answer is 42."
+        assert result.reasoning == "Let me reason about this..."
+
+    def test_parse_thinking_block_dict_format(self, cli_class):
+        """Parses thinking blocks in dict format."""
+        cli = MagicMock()
+        cli.parse_claude_message = cli_class.parse_claude_message.__get__(cli, cli_class)
+
+        messages = [
+            {
+                "content": [
+                    {"type": "thinking", "thinking": "Reasoning step 1"},
+                    {"type": "text", "text": "Final answer"},
+                ]
+            }
+        ]
+        result = cli.parse_claude_message(messages)
+        assert result.text == "Final answer"
+        assert result.reasoning == "Reasoning step 1"
+
+    def test_parse_multiple_thinking_blocks(self, cli_class):
+        """Multiple thinking blocks are joined."""
+        cli = MagicMock()
+        cli.parse_claude_message = cli_class.parse_claude_message.__get__(cli, cli_class)
+
+        messages = [
+            {
+                "content": [
+                    {"type": "thinking", "thinking": "Step 1"},
+                    {"type": "thinking", "thinking": "Step 2"},
+                    {"type": "text", "text": "Answer"},
+                ]
+            }
+        ]
+        result = cli.parse_claude_message(messages)
+        assert result.text == "Answer"
+        assert result.reasoning == "Step 1\nStep 2"
+
+    def test_parse_no_thinking_returns_none_reasoning(self, cli_class):
+        """When no thinking blocks, reasoning is None."""
+        cli = MagicMock()
+        cli.parse_claude_message = cli_class.parse_claude_message.__get__(cli, cli_class)
+
+        messages = [{"content": [{"type": "text", "text": "Simple response"}]}]
+        result = cli.parse_claude_message(messages)
+        assert result.text == "Simple response"
+        assert result.reasoning is None
 
 
 class TestClaudeCodeCLIExtractMetadata:
@@ -634,6 +703,22 @@ class TestClaudeCodeCLIRunCompletion:
                 pass
 
             assert captured_options[0].resume == "sess-123"
+
+    @pytest.mark.asyncio
+    async def test_run_completion_with_max_thinking_tokens(self, cli_instance):
+        """run_completion sets max_thinking_tokens option."""
+        mock_message = {"type": "assistant"}
+        captured_options = []
+
+        async def mock_query(prompt, options):
+            captured_options.append(options)
+            yield mock_message
+
+        with patch("src.claude_cli.query", mock_query):
+            async for _ in cli_instance.run_completion("Hello", max_thinking_tokens=50000):
+                pass
+
+            assert captured_options[0].max_thinking_tokens == 50000
 
     @pytest.mark.asyncio
     async def test_run_completion_converts_objects_to_dicts(self, cli_instance):

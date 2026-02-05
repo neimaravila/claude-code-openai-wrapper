@@ -410,6 +410,9 @@ async def generate_streaming_response(
                 system_prompt = sampling_instructions
             logger.debug(f"Added sampling instructions: {sampling_instructions}")
 
+        # Determine if reasoning is active
+        reasoning_active = request.reasoning_effort is not None
+
         # Filter content for unsupported features
         prompt = MessageAdapter.filter_content(prompt)
         if system_prompt:
@@ -452,6 +455,7 @@ async def generate_streaming_response(
             allowed_tools=claude_options.get("allowed_tools"),
             disallowed_tools=claude_options.get("disallowed_tools"),
             permission_mode=claude_options.get("permission_mode"),
+            max_thinking_tokens=claude_options.get("max_thinking_tokens"),
             stream=True,
         ):
             chunks_buffer.append(chunk)
@@ -488,6 +492,39 @@ async def generate_streaming_response(
                 # Handle content blocks
                 if isinstance(content, list):
                     for block in content:
+                        # Handle ThinkingBlock objects (extended thinking / reasoning)
+                        if hasattr(block, "thinking"):
+                            if reasoning_active:
+                                stream_chunk = ChatCompletionStreamResponse(
+                                    id=request_id,
+                                    model=request.model,
+                                    choices=[
+                                        StreamChoice(
+                                            index=0,
+                                            delta={"reasoning_content": block.thinking},
+                                            finish_reason=None,
+                                        )
+                                    ],
+                                )
+                                yield f"data: {stream_chunk.model_dump_json()}\n\n"
+                            continue
+                        # Handle dict-style thinking blocks
+                        if isinstance(block, dict) and block.get("type") == "thinking":
+                            if reasoning_active:
+                                stream_chunk = ChatCompletionStreamResponse(
+                                    id=request_id,
+                                    model=request.model,
+                                    choices=[
+                                        StreamChoice(
+                                            index=0,
+                                            delta={"reasoning_content": block.get("thinking", "")},
+                                            finish_reason=None,
+                                        )
+                                    ],
+                                )
+                                yield f"data: {stream_chunk.model_dump_json()}\n\n"
+                            continue
+
                         # Handle TextBlock objects from Claude Agent SDK
                         if hasattr(block, "text"):
                             raw_text = block.text
@@ -498,7 +535,9 @@ async def generate_streaming_response(
                             continue
 
                         # Filter out tool usage and thinking blocks
-                        filtered_text = MessageAdapter.filter_content(raw_text)
+                        filtered_text = MessageAdapter.filter_content(
+                            raw_text, preserve_thinking=reasoning_active
+                        )
 
                         if filtered_text and not filtered_text.isspace():
                             # Create streaming chunk
@@ -519,7 +558,9 @@ async def generate_streaming_response(
 
                 elif isinstance(content, str):
                     # Filter out tool usage and thinking blocks
-                    filtered_content = MessageAdapter.filter_content(content)
+                    filtered_content = MessageAdapter.filter_content(
+                        content, preserve_thinking=reasoning_active
+                    )
 
                     if filtered_content and not filtered_content.isspace():
                         # Create streaming chunk
@@ -569,7 +610,8 @@ async def generate_streaming_response(
         # Extract assistant response from all chunks
         assistant_content = None
         if chunks_buffer:
-            assistant_content = claude_cli.parse_claude_message(chunks_buffer)
+            parsed = claude_cli.parse_claude_message(chunks_buffer)
+            assistant_content = parsed.text
 
             # Store in session if applicable
             if actual_session_id and assistant_content:
@@ -651,6 +693,9 @@ async def chat_completions(
             )
         else:
             # Non-streaming response
+            # Determine if reasoning is active
+            reasoning_active = request_body.reasoning_effort is not None
+
             # Process messages with session management
             all_messages, actual_session_id = session_manager.process_messages(
                 request_body.messages, request_body.session_id
@@ -711,18 +756,21 @@ async def chat_completions(
                 allowed_tools=claude_options.get("allowed_tools"),
                 disallowed_tools=claude_options.get("disallowed_tools"),
                 permission_mode=claude_options.get("permission_mode"),
+                max_thinking_tokens=claude_options.get("max_thinking_tokens"),
                 stream=False,
             ):
                 chunks.append(chunk)
 
-            # Extract assistant message
-            raw_assistant_content = claude_cli.parse_claude_message(chunks)
+            # Extract assistant message (returns ParsedMessage)
+            parsed = claude_cli.parse_claude_message(chunks)
 
-            if not raw_assistant_content:
+            if not parsed.text:
                 raise HTTPException(status_code=500, detail="No response from Claude Code")
 
             # Filter out tool usage and thinking blocks
-            assistant_content = MessageAdapter.filter_content(raw_assistant_content)
+            assistant_content = MessageAdapter.filter_content(
+                parsed.text, preserve_thinking=reasoning_active
+            )
 
             # Add assistant response to session if using session mode
             if actual_session_id:
@@ -733,6 +781,11 @@ async def chat_completions(
             prompt_tokens = MessageAdapter.estimate_tokens(prompt)
             completion_tokens = MessageAdapter.estimate_tokens(assistant_content)
 
+            # Build response message with optional reasoning_content
+            response_message = Message(role="assistant", content=assistant_content)
+            if reasoning_active and parsed.reasoning:
+                response_message.reasoning_content = parsed.reasoning
+
             # Create response
             response = ChatCompletionResponse(
                 id=request_id,
@@ -740,7 +793,7 @@ async def chat_completions(
                 choices=[
                     Choice(
                         index=0,
-                        message=Message(role="assistant", content=assistant_content),
+                        message=response_message,
                         finish_reason="stop",
                     )
                 ],
@@ -823,14 +876,14 @@ async def anthropic_messages(
         ):
             chunks.append(chunk)
 
-        # Extract assistant message
-        raw_assistant_content = claude_cli.parse_claude_message(chunks)
+        # Extract assistant message (returns ParsedMessage)
+        parsed = claude_cli.parse_claude_message(chunks)
 
-        if not raw_assistant_content:
+        if not parsed.text:
             raise HTTPException(status_code=500, detail="No response from Claude Code")
 
         # Filter out tool usage and thinking blocks
-        assistant_content = MessageAdapter.filter_content(raw_assistant_content)
+        assistant_content = MessageAdapter.filter_content(parsed.text)
 
         # Estimate tokens
         prompt_tokens = MessageAdapter.estimate_tokens(prompt)

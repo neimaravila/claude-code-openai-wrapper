@@ -34,17 +34,24 @@ class MessageAdapter:
         return prompt, system_prompt
 
     @staticmethod
-    def filter_content(content: str) -> str:
+    def filter_content(content: str, preserve_thinking: bool = False) -> str:
         """
         Filter content for unsupported features and tool usage.
         Remove thinking blocks, tool calls, and image references.
+
+        Args:
+            content: The content to filter.
+            preserve_thinking: If True, skip removal of <thinking> blocks
+                (used when reasoning_effort is active so thinking content
+                 can be captured separately).
         """
         if not content:
             return content
 
         # Remove thinking blocks (common when tools are disabled but Claude tries to think)
-        thinking_pattern = r"<thinking>.*?</thinking>"
-        content = re.sub(thinking_pattern, "", content, flags=re.DOTALL)
+        if not preserve_thinking:
+            thinking_pattern = r"<thinking>.*?</thinking>"
+            content = re.sub(thinking_pattern, "", content, flags=re.DOTALL)
 
         # Extract content from attempt_completion blocks (these contain the actual user response)
         attempt_completion_pattern = r"<attempt_completion>(.*?)</attempt_completion>"

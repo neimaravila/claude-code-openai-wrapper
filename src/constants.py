@@ -109,6 +109,10 @@ DEFAULT_PORT = 8000
 SESSION_CLEANUP_INTERVAL_MINUTES = 5
 SESSION_MAX_AGE_MINUTES = 60
 
+# Reasoning Effort Mapping
+# Maps OpenAI-style reasoning_effort values to max_thinking_tokens for Claude SDK
+REASONING_EFFORT_MAP = {"low": 5000, "medium": 16000, "high": 50000}
+
 # Rate Limiting (requests per minute)
 RATE_LIMIT_DEFAULT = 60
 RATE_LIMIT_CHAT = 30

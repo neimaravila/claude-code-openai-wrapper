@@ -101,6 +101,30 @@ class TestMessage:
         msg = Message(role="user", content=[])
         assert msg.content == ""
 
+    def test_message_reasoning_content_default_none(self):
+        """Message reasoning_content defaults to None."""
+        msg = Message(role="assistant", content="Hello")
+        assert msg.reasoning_content is None
+
+    def test_message_reasoning_content_set(self):
+        """Can set reasoning_content on a message."""
+        msg = Message(role="assistant", content="Answer", reasoning_content="I thought about it")
+        assert msg.reasoning_content == "I thought about it"
+
+    def test_message_exclude_none_in_dump(self):
+        """Message model_dump excludes None fields."""
+        msg = Message(role="assistant", content="Hello")
+        dumped = msg.model_dump()
+        assert "reasoning_content" not in dumped
+        assert "name" not in dumped
+
+    def test_message_includes_reasoning_when_set(self):
+        """Message model_dump includes reasoning_content when set."""
+        msg = Message(role="assistant", content="Answer", reasoning_content="Thinking...")
+        dumped = msg.model_dump()
+        assert "reasoning_content" in dumped
+        assert dumped["reasoning_content"] == "Thinking..."
+
 
 class TestStreamOptions:
     """Test StreamOptions model."""
@@ -245,23 +269,44 @@ class TestChatCompletionRequest:
         options = request.to_claude_options()
         assert options["model"] == "claude-sonnet-4-5-20250929"
 
-    def test_to_claude_options_with_max_tokens(self):
-        """to_claude_options() maps max_tokens to max_thinking_tokens."""
+    def test_to_claude_options_with_reasoning_effort_low(self):
+        """to_claude_options() maps reasoning_effort='low' to max_thinking_tokens."""
+        request = ChatCompletionRequest(
+            messages=[Message(role="user", content="Hi")], reasoning_effort="low"
+        )
+        options = request.to_claude_options()
+        assert options.get("max_thinking_tokens") == 5000
+
+    def test_to_claude_options_with_reasoning_effort_medium(self):
+        """to_claude_options() maps reasoning_effort='medium' to max_thinking_tokens."""
+        request = ChatCompletionRequest(
+            messages=[Message(role="user", content="Hi")], reasoning_effort="medium"
+        )
+        options = request.to_claude_options()
+        assert options.get("max_thinking_tokens") == 16000
+
+    def test_to_claude_options_with_reasoning_effort_high(self):
+        """to_claude_options() maps reasoning_effort='high' to max_thinking_tokens."""
+        request = ChatCompletionRequest(
+            messages=[Message(role="user", content="Hi")], reasoning_effort="high"
+        )
+        options = request.to_claude_options()
+        assert options.get("max_thinking_tokens") == 50000
+
+    def test_to_claude_options_no_reasoning_effort(self):
+        """to_claude_options() omits max_thinking_tokens when reasoning_effort is None."""
         request = ChatCompletionRequest(
             messages=[Message(role="user", content="Hi")], max_tokens=500
         )
         options = request.to_claude_options()
-        assert options.get("max_thinking_tokens") == 500
+        assert "max_thinking_tokens" not in options
 
-    def test_to_claude_options_prefers_max_completion_tokens(self):
-        """max_completion_tokens takes precedence over max_tokens."""
-        request = ChatCompletionRequest(
-            messages=[Message(role="user", content="Hi")],
-            max_tokens=500,
-            max_completion_tokens=1000,
-        )
-        options = request.to_claude_options()
-        assert options.get("max_thinking_tokens") == 1000
+    def test_reasoning_effort_invalid_value(self):
+        """Invalid reasoning_effort value is rejected."""
+        with pytest.raises(ValueError):
+            ChatCompletionRequest(
+                messages=[Message(role="user", content="Hi")], reasoning_effort="extreme"
+            )
 
 
 class TestChatCompletionResponse:
