@@ -427,6 +427,22 @@ class AnthropicTextBlock(BaseModel):
     text: str
 
 
+class AnthropicThinkingBlock(BaseModel):
+    """Anthropic thinking content block (extended thinking)."""
+
+    type: Literal["thinking"] = "thinking"
+    thinking: str
+
+
+class AnthropicThinkingConfig(BaseModel):
+    """Anthropic extended thinking configuration."""
+
+    type: Literal["enabled", "disabled"] = "enabled"
+    budget_tokens: Optional[int] = Field(
+        default=None, description="Maximum tokens for thinking (required when type=enabled)"
+    )
+
+
 class AnthropicMessage(BaseModel):
     """Anthropic message format."""
 
@@ -447,6 +463,20 @@ class AnthropicMessagesRequest(BaseModel):
     stop_sequences: Optional[List[str]] = None
     stream: Optional[bool] = False
     metadata: Optional[Dict[str, Any]] = None
+    thinking: Optional[AnthropicThinkingConfig] = Field(
+        default=None, description="Extended thinking configuration"
+    )
+
+    def get_max_thinking_tokens(self) -> Optional[int]:
+        """Get max_thinking_tokens from thinking config, defaulting to high effort."""
+        from src.constants import REASONING_EFFORT_MAP
+
+        if self.thinking is not None:
+            if self.thinking.type == "disabled":
+                return None
+            return self.thinking.budget_tokens or REASONING_EFFORT_MAP["high"]
+        # Default: always enable extended thinking (matches OpenAI endpoint behavior)
+        return REASONING_EFFORT_MAP["high"]
 
     def to_openai_messages(self) -> List[Message]:
         """Convert Anthropic messages to OpenAI format."""
@@ -476,7 +506,7 @@ class AnthropicMessagesResponse(BaseModel):
     id: str = Field(default_factory=lambda: f"msg_{uuid.uuid4().hex[:24]}")
     type: Literal["message"] = "message"
     role: Literal["assistant"] = "assistant"
-    content: List[AnthropicTextBlock]
+    content: List[Union[AnthropicThinkingBlock, AnthropicTextBlock]]
     model: str
     stop_reason: Optional[Literal["end_turn", "max_tokens", "stop_sequence"]] = "end_turn"
     stop_sequence: Optional[str] = None

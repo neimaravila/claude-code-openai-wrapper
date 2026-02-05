@@ -37,6 +37,7 @@ from src.models import (
     AnthropicMessagesRequest,
     AnthropicMessagesResponse,
     AnthropicTextBlock,
+    AnthropicThinkingBlock,
     AnthropicUsage,
 )
 from src.claude_cli import ClaudeCodeCLI
@@ -853,6 +854,9 @@ async def anthropic_messages(
         if system_prompt:
             system_prompt = MessageAdapter.filter_content(system_prompt)
 
+        # Get max_thinking_tokens from thinking config (defaults to high)
+        max_thinking_tokens = request_body.get_max_thinking_tokens()
+
         # Run Claude Code - tools enabled by default for Anthropic SDK clients
         # (they're typically using this for agentic workflows)
         chunks = []
@@ -863,6 +867,7 @@ async def anthropic_messages(
             max_turns=10,
             allowed_tools=DEFAULT_ALLOWED_TOOLS,
             permission_mode="bypassPermissions",
+            max_thinking_tokens=max_thinking_tokens,
             stream=False,
         ):
             chunks.append(chunk)
@@ -873,17 +878,23 @@ async def anthropic_messages(
         if not parsed.text:
             raise HTTPException(status_code=500, detail="No response from Claude Code")
 
-        # Filter out tool usage and thinking blocks
-        assistant_content = MessageAdapter.filter_content(parsed.text)
+        # Filter out tool usage (preserve thinking for separate handling)
+        assistant_content = MessageAdapter.filter_content(parsed.text, preserve_thinking=True)
 
         # Estimate tokens
         prompt_tokens = MessageAdapter.estimate_tokens(prompt)
         completion_tokens = MessageAdapter.estimate_tokens(assistant_content)
 
+        # Build content blocks (thinking + text, matching Anthropic API format)
+        content_blocks: list = []
+        if parsed.reasoning:
+            content_blocks.append(AnthropicThinkingBlock(thinking=parsed.reasoning))
+        content_blocks.append(AnthropicTextBlock(text=assistant_content))
+
         # Create Anthropic-format response
         response = AnthropicMessagesResponse(
             model=request_body.model,
-            content=[AnthropicTextBlock(text=assistant_content)],
+            content=content_blocks,
             stop_reason="end_turn",
             usage=AnthropicUsage(
                 input_tokens=prompt_tokens,
@@ -891,7 +902,7 @@ async def anthropic_messages(
             ),
         )
 
-        return response
+        return JSONResponse(content=response.model_dump(exclude_none=True))
 
     except HTTPException:
         raise
