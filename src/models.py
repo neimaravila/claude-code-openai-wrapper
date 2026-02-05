@@ -28,11 +28,6 @@ class Message(BaseModel):
     name: Optional[str] = None
     reasoning_content: Optional[str] = None
 
-    def model_dump(self, **kwargs):
-        """Override to exclude None fields by default for clean JSON output."""
-        kwargs.setdefault("exclude_none", True)
-        return super().model_dump(**kwargs)
-
     @model_validator(mode="after")
     def normalize_content(self):
         """Convert array content to string for Claude Code compatibility."""

@@ -112,16 +112,16 @@ class TestMessage:
         assert msg.reasoning_content == "I thought about it"
 
     def test_message_exclude_none_in_dump(self):
-        """Message model_dump excludes None fields."""
+        """model_dump(exclude_none=True) omits None fields like reasoning_content."""
         msg = Message(role="assistant", content="Hello")
-        dumped = msg.model_dump()
+        dumped = msg.model_dump(exclude_none=True)
         assert "reasoning_content" not in dumped
         assert "name" not in dumped
 
     def test_message_includes_reasoning_when_set(self):
-        """Message model_dump includes reasoning_content when set."""
+        """model_dump(exclude_none=True) includes reasoning_content when set."""
         msg = Message(role="assistant", content="Answer", reasoning_content="Thinking...")
-        dumped = msg.model_dump()
+        dumped = msg.model_dump(exclude_none=True)
         assert "reasoning_content" in dumped
         assert dumped["reasoning_content"] == "Thinking..."
 

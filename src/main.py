@@ -795,7 +795,7 @@ async def chat_completions(
                 ),
             )
 
-            return response
+            return JSONResponse(content=response.model_dump(exclude_none=True))
 
     except HTTPException:
         raise
