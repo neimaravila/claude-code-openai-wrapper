@@ -78,7 +78,7 @@ class ChatCompletionRequest(BaseModel):
         description="Enable Claude Code tools (Read, Write, Bash, etc.) - disabled by default for OpenAI compatibility",
     )
     reasoning_effort: Optional[Literal["low", "medium", "high"]] = Field(
-        default=None,
+        default="high",
         description="Reasoning effort level that maps to Claude's max_thinking_tokens",
     )
     stream_options: Optional[StreamOptions] = Field(

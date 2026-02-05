@@ -294,12 +294,19 @@ class TestChatCompletionRequest:
         assert options.get("max_thinking_tokens") == 50000
 
     def test_to_claude_options_no_reasoning_effort(self):
-        """to_claude_options() omits max_thinking_tokens when reasoning_effort is None."""
+        """to_claude_options() omits max_thinking_tokens when reasoning_effort is explicitly None."""
         request = ChatCompletionRequest(
-            messages=[Message(role="user", content="Hi")], max_tokens=500
+            messages=[Message(role="user", content="Hi")], reasoning_effort=None
         )
         options = request.to_claude_options()
         assert "max_thinking_tokens" not in options
+
+    def test_reasoning_effort_defaults_to_high(self):
+        """reasoning_effort defaults to 'high' when not specified."""
+        request = ChatCompletionRequest(messages=[Message(role="user", content="Hi")])
+        assert request.reasoning_effort == "high"
+        options = request.to_claude_options()
+        assert options.get("max_thinking_tokens") == 50000
 
     def test_reasoning_effort_invalid_value(self):
         """Invalid reasoning_effort value is rejected."""
