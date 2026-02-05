@@ -211,20 +211,21 @@ class ClaudeCodeCLI:
 
         Prioritizes ResultMessage.result for multi-turn conversations,
         falls back to last AssistantMessage content.
+        Always collects reasoning from ThinkingBlock content across all messages.
 
         Returns a ParsedMessage with text and optional reasoning content.
         """
-        # First, check for ResultMessage with 'result' field (multi-turn completion)
-        for message in messages:
-            if message.get("subtype") == "success" and "result" in message:
-                return ParsedMessage(text=message["result"])
-
-        # Collect all text and reasoning from AssistantMessages (take the last one)
+        result_text = None
         last_text = None
         reasoning_parts = []
+
         for message in messages:
+            # Check for ResultMessage with 'result' field (multi-turn completion)
+            if message.get("subtype") == "success" and "result" in message:
+                result_text = message["result"]
+
             # Look for AssistantMessage type (new SDK format)
-            if "content" in message and isinstance(message["content"], list):
+            elif "content" in message and isinstance(message["content"], list):
                 text_parts = []
                 for block in message["content"]:
                     # Handle ThinkingBlock objects (extended thinking)
@@ -261,8 +262,10 @@ class ClaudeCodeCLI:
                     elif isinstance(content, str):
                         last_text = content
 
+        # ResultMessage.result takes priority for text, fall back to last AssistantMessage
+        final_text = result_text if result_text is not None else last_text
         reasoning = "\n".join(reasoning_parts) if reasoning_parts else None
-        return ParsedMessage(text=last_text, reasoning=reasoning)
+        return ParsedMessage(text=final_text, reasoning=reasoning)
 
     def extract_metadata(self, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Extract metadata like costs, tokens, and session info from SDK messages."""
