@@ -410,9 +410,6 @@ async def generate_streaming_response(
                 system_prompt = sampling_instructions
             logger.debug(f"Added sampling instructions: {sampling_instructions}")
 
-        # Determine if reasoning is active
-        reasoning_active = request.reasoning_effort is not None
-
         # Filter content for unsupported features
         prompt = MessageAdapter.filter_content(prompt)
         if system_prompt:
@@ -494,35 +491,33 @@ async def generate_streaming_response(
                     for block in content:
                         # Handle ThinkingBlock objects (extended thinking / reasoning)
                         if hasattr(block, "thinking"):
-                            if reasoning_active:
-                                stream_chunk = ChatCompletionStreamResponse(
-                                    id=request_id,
-                                    model=request.model,
-                                    choices=[
-                                        StreamChoice(
-                                            index=0,
-                                            delta={"reasoning_content": block.thinking},
-                                            finish_reason=None,
-                                        )
-                                    ],
-                                )
-                                yield f"data: {stream_chunk.model_dump_json()}\n\n"
+                            stream_chunk = ChatCompletionStreamResponse(
+                                id=request_id,
+                                model=request.model,
+                                choices=[
+                                    StreamChoice(
+                                        index=0,
+                                        delta={"reasoning_content": block.thinking},
+                                        finish_reason=None,
+                                    )
+                                ],
+                            )
+                            yield f"data: {stream_chunk.model_dump_json()}\n\n"
                             continue
                         # Handle dict-style thinking blocks
                         if isinstance(block, dict) and block.get("type") == "thinking":
-                            if reasoning_active:
-                                stream_chunk = ChatCompletionStreamResponse(
-                                    id=request_id,
-                                    model=request.model,
-                                    choices=[
-                                        StreamChoice(
-                                            index=0,
-                                            delta={"reasoning_content": block.get("thinking", "")},
-                                            finish_reason=None,
-                                        )
-                                    ],
-                                )
-                                yield f"data: {stream_chunk.model_dump_json()}\n\n"
+                            stream_chunk = ChatCompletionStreamResponse(
+                                id=request_id,
+                                model=request.model,
+                                choices=[
+                                    StreamChoice(
+                                        index=0,
+                                        delta={"reasoning_content": block.get("thinking", "")},
+                                        finish_reason=None,
+                                    )
+                                ],
+                            )
+                            yield f"data: {stream_chunk.model_dump_json()}\n\n"
                             continue
 
                         # Handle TextBlock objects from Claude Agent SDK
@@ -534,9 +529,10 @@ async def generate_streaming_response(
                         else:
                             continue
 
-                        # Filter out tool usage and thinking blocks
+                        # Filter out tool usage (preserve thinking since
+                        # ThinkingBlock objects are handled separately above)
                         filtered_text = MessageAdapter.filter_content(
-                            raw_text, preserve_thinking=reasoning_active
+                            raw_text, preserve_thinking=True
                         )
 
                         if filtered_text and not filtered_text.isspace():
@@ -557,9 +553,9 @@ async def generate_streaming_response(
                             content_sent = True
 
                 elif isinstance(content, str):
-                    # Filter out tool usage and thinking blocks
+                    # Filter out tool usage (preserve thinking for separate handling)
                     filtered_content = MessageAdapter.filter_content(
-                        content, preserve_thinking=reasoning_active
+                        content, preserve_thinking=True
                     )
 
                     if filtered_content and not filtered_content.isspace():
@@ -693,9 +689,6 @@ async def chat_completions(
             )
         else:
             # Non-streaming response
-            # Determine if reasoning is active
-            reasoning_active = request_body.reasoning_effort is not None
-
             # Process messages with session management
             all_messages, actual_session_id = session_manager.process_messages(
                 request_body.messages, request_body.session_id
@@ -767,10 +760,8 @@ async def chat_completions(
             if not parsed.text:
                 raise HTTPException(status_code=500, detail="No response from Claude Code")
 
-            # Filter out tool usage and thinking blocks
-            assistant_content = MessageAdapter.filter_content(
-                parsed.text, preserve_thinking=reasoning_active
-            )
+            # Filter out tool usage (preserve thinking for separate handling)
+            assistant_content = MessageAdapter.filter_content(parsed.text, preserve_thinking=True)
 
             # Add assistant response to session if using session mode
             if actual_session_id:
@@ -783,7 +774,7 @@ async def chat_completions(
 
             # Build response message with optional reasoning_content
             response_message = Message(role="assistant", content=assistant_content)
-            if reasoning_active and parsed.reasoning:
+            if parsed.reasoning:
                 response_message.reasoning_content = parsed.reasoning
 
             # Create response
