@@ -38,7 +38,11 @@ from src.models import (
     AnthropicMessagesResponse,
     AnthropicTextBlock,
     AnthropicThinkingBlock,
+    AnthropicToolUseBlock,
     AnthropicUsage,
+    # OpenAI tool calling models
+    ToolCall,
+    FunctionCall,
 )
 from src.claude_cli import ClaudeCodeCLI
 from src.message_adapter import MessageAdapter
@@ -53,6 +57,10 @@ from src.rate_limiter import (
     rate_limit_endpoint,
 )
 from src.constants import CLAUDE_MODELS, CLAUDE_TOOLS, DEFAULT_ALLOWED_TOOLS
+from src.tool_bridge import (
+    create_client_tools_mcp_server,
+    anthropic_tool_defs_to_bridge_format,
+)
 
 # Load environment variables
 load_dotenv()
@@ -406,23 +414,49 @@ async def generate_anthropic_streaming_response(
         prompt_parts = []
         for msg in messages:
             if msg.role == "user":
-                prompt_parts.append(msg.content)
+                prompt_parts.append(msg.content if msg.content else "")
             elif msg.role == "assistant":
-                prompt_parts.append(f"Assistant: {msg.content}")
+                prompt_parts.append(f"Assistant: {msg.content if msg.content else ''}")
 
         prompt = "\n\n".join(prompt_parts)
         system_prompt = request_body.system
 
+        # Include tool_result context from conversation history
+        tool_result_context = request_body.get_tool_result_context()
+        if tool_result_context:
+            prompt = f"{prompt}\n\n{tool_result_context}"
+
+        # Determine if client tools are present
+        has_client_tools = bool(request_body.tools)
+        preserve_tools = has_client_tools
+
         # Filter content
-        prompt = MessageAdapter.filter_content(prompt)
+        prompt = MessageAdapter.filter_content(prompt, preserve_tools=preserve_tools)
         if system_prompt:
-            system_prompt = MessageAdapter.filter_content(system_prompt)
+            system_prompt = MessageAdapter.filter_content(
+                system_prompt, preserve_tools=preserve_tools
+            )
 
         # Get max_thinking_tokens from thinking config
         max_thinking_tokens = request_body.get_max_thinking_tokens()
 
         # Estimate input tokens
         input_tokens = MessageAdapter.estimate_tokens(prompt)
+
+        # Set up SDK options
+        allowed_tools = list(DEFAULT_ALLOWED_TOOLS)
+        max_turns = 10
+        mcp_servers = None
+
+        # Handle client-defined tools
+        if has_client_tools:
+            bridge_defs = anthropic_tool_defs_to_bridge_format(request_body.tools)
+            mcp_server = create_client_tools_mcp_server(bridge_defs)
+            mcp_servers = [mcp_server]
+            for td in request_body.tools:
+                if td.name not in allowed_tools:
+                    allowed_tools.append(td.name)
+            max_turns = 1
 
         # Emit message_start
         msg_id = f"msg_{os.urandom(12).hex()}"
@@ -445,15 +479,17 @@ async def generate_anthropic_streaming_response(
 
         block_index = 0
         output_text = ""
+        has_tool_use = False
 
         async for chunk in claude_cli.run_completion(
             prompt=prompt,
             system_prompt=system_prompt,
             model=request_body.model,
-            max_turns=10,
-            allowed_tools=DEFAULT_ALLOWED_TOOLS,
+            max_turns=max_turns,
+            allowed_tools=allowed_tools,
             permission_mode="bypassPermissions",
             max_thinking_tokens=max_thinking_tokens,
+            mcp_servers=mcp_servers,
             stream=True,
         ):
             # Extract content from chunk (same logic as OpenAI streaming)
@@ -473,8 +509,7 @@ async def generate_anthropic_streaming_response(
 
             for block in content:
                 # ThinkingBlock (has .thinking attribute)
-                if hasattr(block, "thinking"):
-                    # content_block_start
+                if hasattr(block, "thinking") and not hasattr(block, "text"):
                     yield anthropic_sse(
                         "content_block_start",
                         {
@@ -483,7 +518,6 @@ async def generate_anthropic_streaming_response(
                             "content_block": {"type": "thinking", "thinking": ""},
                         },
                     )
-                    # thinking_delta
                     yield anthropic_sse(
                         "content_block_delta",
                         {
@@ -492,17 +526,61 @@ async def generate_anthropic_streaming_response(
                             "delta": {"type": "thinking_delta", "thinking": block.thinking},
                         },
                     )
-                    # signature_delta (if present)
                     if hasattr(block, "signature") and block.signature:
                         yield anthropic_sse(
                             "content_block_delta",
                             {
                                 "type": "content_block_delta",
                                 "index": block_index,
-                                "delta": {"type": "signature_delta", "signature": block.signature},
+                                "delta": {
+                                    "type": "signature_delta",
+                                    "signature": block.signature,
+                                },
                             },
                         )
-                    # content_block_stop
+                    yield anthropic_sse(
+                        "content_block_stop",
+                        {"type": "content_block_stop", "index": block_index},
+                    )
+                    block_index += 1
+                    continue
+
+                # ToolUseBlock (has .name + .input + .id, no .text/.thinking)
+                if (
+                    hasattr(block, "name")
+                    and hasattr(block, "input")
+                    and hasattr(block, "id")
+                    and not hasattr(block, "text")
+                    and not hasattr(block, "thinking")
+                ):
+                    has_tool_use = True
+                    block_input = block.input if isinstance(block.input, dict) else {}
+                    # content_block_start with tool_use
+                    yield anthropic_sse(
+                        "content_block_start",
+                        {
+                            "type": "content_block_start",
+                            "index": block_index,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": block.id,
+                                "name": block.name,
+                                "input": {},
+                            },
+                        },
+                    )
+                    # input_json_delta
+                    yield anthropic_sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": block_index,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": json.dumps(block_input),
+                            },
+                        },
+                    )
                     yield anthropic_sse(
                         "content_block_stop",
                         {"type": "content_block_stop", "index": block_index},
@@ -550,6 +628,40 @@ async def generate_anthropic_streaming_response(
                     block_index += 1
                     continue
 
+                # Dict-style tool_use block
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    has_tool_use = True
+                    yield anthropic_sse(
+                        "content_block_start",
+                        {
+                            "type": "content_block_start",
+                            "index": block_index,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": block.get("id", ""),
+                                "name": block.get("name", ""),
+                                "input": {},
+                            },
+                        },
+                    )
+                    yield anthropic_sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": block_index,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": json.dumps(block.get("input", {})),
+                            },
+                        },
+                    )
+                    yield anthropic_sse(
+                        "content_block_stop",
+                        {"type": "content_block_stop", "index": block_index},
+                    )
+                    block_index += 1
+                    continue
+
                 # TextBlock (has .text attribute or dict with type=text)
                 if hasattr(block, "text"):
                     raw_text = block.text
@@ -558,7 +670,9 @@ async def generate_anthropic_streaming_response(
                 else:
                     continue
 
-                filtered_text = MessageAdapter.filter_content(raw_text, preserve_thinking=True)
+                filtered_text = MessageAdapter.filter_content(
+                    raw_text, preserve_thinking=True, preserve_tools=preserve_tools
+                )
                 if not filtered_text or filtered_text.isspace():
                     continue
 
@@ -592,12 +706,15 @@ async def generate_anthropic_streaming_response(
         # Estimate output tokens
         output_tokens = MessageAdapter.estimate_tokens(output_text) if output_text else 1
 
+        # Determine stop_reason
+        stop_reason = "tool_use" if has_tool_use else "end_turn"
+
         # Emit message_delta with stop_reason
         yield anthropic_sse(
             "message_delta",
             {
                 "type": "message_delta",
-                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
                 "usage": {"output_tokens": output_tokens},
             },
         )
@@ -651,8 +768,24 @@ async def generate_streaming_response(
         if claude_options.get("model"):
             ParameterValidator.validate_model(claude_options["model"])
 
-        # Handle tools - disabled by default for OpenAI compatibility
-        if not request.enable_tools:
+        # Determine if client-defined tools are present
+        has_client_tools = bool(request.tools)
+        mcp_servers = None
+
+        # Handle tools
+        if has_client_tools:
+            bridge_defs = MessageAdapter.openai_tools_to_anthropic(request.tools)
+            mcp_server = create_client_tools_mcp_server(bridge_defs)
+            mcp_servers = [mcp_server]
+            allowed_tool_names = list(DEFAULT_ALLOWED_TOOLS)
+            for td in request.tools:
+                if td.function.name not in allowed_tool_names:
+                    allowed_tool_names.append(td.function.name)
+            claude_options["allowed_tools"] = allowed_tool_names
+            claude_options["permission_mode"] = "bypassPermissions"
+            claude_options["max_turns"] = 1
+            logger.info(f"Client tools registered: {[td.function.name for td in request.tools]}")
+        elif not request.enable_tools:
             # Disable all tools by using CLAUDE_TOOLS constant
             claude_options["disallowed_tools"] = CLAUDE_TOOLS
             claude_options["max_turns"] = 1  # Single turn for Q&A
@@ -664,10 +797,20 @@ async def generate_streaming_response(
             claude_options["permission_mode"] = "bypassPermissions"
             logger.info(f"Tools enabled by user request: {DEFAULT_ALLOWED_TOOLS}")
 
+        preserve_tools = has_client_tools or request.enable_tools
+
+        # Re-filter with preserve_tools if needed
+        if preserve_tools:
+            prompt = MessageAdapter.filter_content(prompt, preserve_tools=True)
+            if system_prompt:
+                system_prompt = MessageAdapter.filter_content(system_prompt, preserve_tools=True)
+
         # Run Claude Code
         chunks_buffer = []
         role_sent = False  # Track if we've sent the initial role chunk
         content_sent = False  # Track if we've sent any content
+        has_tool_use = False
+        tool_call_index = 0
 
         async for chunk in claude_cli.run_completion(
             prompt=prompt,
@@ -678,20 +821,18 @@ async def generate_streaming_response(
             disallowed_tools=claude_options.get("disallowed_tools"),
             permission_mode=claude_options.get("permission_mode"),
             max_thinking_tokens=claude_options.get("max_thinking_tokens"),
+            mcp_servers=mcp_servers,
             stream=True,
         ):
             chunks_buffer.append(chunk)
 
             # Check if we have an assistant message
-            # Handle both old format (type/message structure) and new format (direct content)
             content = None
             if chunk.get("type") == "assistant" and "message" in chunk:
-                # Old format: {"type": "assistant", "message": {"content": [...]}}
                 message = chunk["message"]
                 if isinstance(message, dict) and "content" in message:
                     content = message["content"]
             elif "content" in chunk and isinstance(chunk["content"], list):
-                # New format: {"content": [TextBlock(...)]}  (converted AssistantMessage)
                 content = chunk["content"]
 
             if content is not None:
@@ -715,7 +856,7 @@ async def generate_streaming_response(
                 if isinstance(content, list):
                     for block in content:
                         # Handle ThinkingBlock objects (extended thinking / reasoning)
-                        if hasattr(block, "thinking"):
+                        if hasattr(block, "thinking") and not hasattr(block, "text"):
                             stream_chunk = ChatCompletionStreamResponse(
                                 id=request_id,
                                 model=request.model,
@@ -729,6 +870,7 @@ async def generate_streaming_response(
                             )
                             yield f"data: {stream_chunk.model_dump_json()}\n\n"
                             continue
+
                         # Handle dict-style thinking blocks
                         if isinstance(block, dict) and block.get("type") == "thinking":
                             stream_chunk = ChatCompletionStreamResponse(
@@ -745,23 +887,93 @@ async def generate_streaming_response(
                             yield f"data: {stream_chunk.model_dump_json()}\n\n"
                             continue
 
+                        # Handle ToolUseBlock objects (has .name + .input + .id)
+                        if (
+                            hasattr(block, "name")
+                            and hasattr(block, "input")
+                            and hasattr(block, "id")
+                            and not hasattr(block, "text")
+                            and not hasattr(block, "thinking")
+                        ):
+                            has_tool_use = True
+                            block_input = block.input if isinstance(block.input, dict) else {}
+                            stream_chunk = ChatCompletionStreamResponse(
+                                id=request_id,
+                                model=request.model,
+                                choices=[
+                                    StreamChoice(
+                                        index=0,
+                                        delta={
+                                            "tool_calls": [
+                                                {
+                                                    "index": tool_call_index,
+                                                    "id": block.id,
+                                                    "type": "function",
+                                                    "function": {
+                                                        "name": block.name,
+                                                        "arguments": json.dumps(block_input),
+                                                    },
+                                                }
+                                            ]
+                                        },
+                                        finish_reason=None,
+                                    )
+                                ],
+                            )
+                            yield f"data: {stream_chunk.model_dump_json()}\n\n"
+                            tool_call_index += 1
+                            content_sent = True
+                            continue
+
+                        # Handle dict-style tool_use blocks
+                        if isinstance(block, dict) and block.get("type") == "tool_use":
+                            has_tool_use = True
+                            stream_chunk = ChatCompletionStreamResponse(
+                                id=request_id,
+                                model=request.model,
+                                choices=[
+                                    StreamChoice(
+                                        index=0,
+                                        delta={
+                                            "tool_calls": [
+                                                {
+                                                    "index": tool_call_index,
+                                                    "id": block.get("id", ""),
+                                                    "type": "function",
+                                                    "function": {
+                                                        "name": block.get("name", ""),
+                                                        "arguments": json.dumps(
+                                                            block.get("input", {})
+                                                        ),
+                                                    },
+                                                }
+                                            ]
+                                        },
+                                        finish_reason=None,
+                                    )
+                                ],
+                            )
+                            yield f"data: {stream_chunk.model_dump_json()}\n\n"
+                            tool_call_index += 1
+                            content_sent = True
+                            continue
+
                         # Handle TextBlock objects from Claude Agent SDK
                         if hasattr(block, "text"):
                             raw_text = block.text
-                        # Handle dictionary format for backward compatibility
                         elif isinstance(block, dict) and block.get("type") == "text":
                             raw_text = block.get("text", "")
                         else:
                             continue
 
-                        # Filter out tool usage (preserve thinking since
-                        # ThinkingBlock objects are handled separately above)
+                        # Filter out tool usage
                         filtered_text = MessageAdapter.filter_content(
-                            raw_text, preserve_thinking=True
+                            raw_text,
+                            preserve_thinking=True,
+                            preserve_tools=preserve_tools,
                         )
 
                         if filtered_text and not filtered_text.isspace():
-                            # Create streaming chunk
                             stream_chunk = ChatCompletionStreamResponse(
                                 id=request_id,
                                 model=request.model,
@@ -773,34 +985,31 @@ async def generate_streaming_response(
                                     )
                                 ],
                             )
-
                             yield f"data: {stream_chunk.model_dump_json()}\n\n"
                             content_sent = True
 
                 elif isinstance(content, str):
-                    # Filter out tool usage (preserve thinking for separate handling)
                     filtered_content = MessageAdapter.filter_content(
-                        content, preserve_thinking=True
+                        content, preserve_thinking=True, preserve_tools=preserve_tools
                     )
 
                     if filtered_content and not filtered_content.isspace():
-                        # Create streaming chunk
                         stream_chunk = ChatCompletionStreamResponse(
                             id=request_id,
                             model=request.model,
                             choices=[
                                 StreamChoice(
-                                    index=0, delta={"content": filtered_content}, finish_reason=None
+                                    index=0,
+                                    delta={"content": filtered_content},
+                                    finish_reason=None,
                                 )
                             ],
                         )
-
                         yield f"data: {stream_chunk.model_dump_json()}\n\n"
                         content_sent = True
 
         # Handle case where no role was sent (send at least role chunk)
         if not role_sent:
-            # Send role chunk with empty content if we never got any assistant messages
             initial_chunk = ChatCompletionStreamResponse(
                 id=request_id,
                 model=request.model,
@@ -842,7 +1051,6 @@ async def generate_streaming_response(
         # Prepare usage data if requested
         usage_data = None
         if request.stream_options and request.stream_options.include_usage:
-            # Estimate token usage based on prompt and completion
             completion_text = assistant_content or ""
             token_usage = claude_cli.estimate_token_usage(prompt, completion_text, request.model)
             usage_data = Usage(
@@ -852,11 +1060,14 @@ async def generate_streaming_response(
             )
             logger.debug(f"Estimated usage: {usage_data}")
 
+        # Determine finish_reason
+        finish_reason = "tool_calls" if has_tool_use else "stop"
+
         # Send final chunk with finish reason and optionally usage data
         final_chunk = ChatCompletionStreamResponse(
             id=request_id,
             model=request.model,
-            choices=[StreamChoice(index=0, delta={}, finish_reason="stop")],
+            choices=[StreamChoice(index=0, delta={}, finish_reason=finish_reason)],
             usage=usage_data,
         )
         yield f"data: {final_chunk.model_dump_json()}\n\n"
@@ -951,8 +1162,27 @@ async def chat_completions(
             if claude_options.get("model"):
                 ParameterValidator.validate_model(claude_options["model"])
 
+            # Determine if client-defined tools are present
+            has_client_tools = bool(request_body.tools)
+            mcp_servers = None
+
             # Handle tools - disabled by default for OpenAI compatibility
-            if not request_body.enable_tools:
+            if has_client_tools:
+                # Client-defined tools: enable tools + register via MCP bridge
+                bridge_defs = MessageAdapter.openai_tools_to_anthropic(request_body.tools)
+                mcp_server = create_client_tools_mcp_server(bridge_defs)
+                mcp_servers = [mcp_server]
+                allowed_tool_names = list(DEFAULT_ALLOWED_TOOLS)
+                for td in request_body.tools:
+                    if td.function.name not in allowed_tool_names:
+                        allowed_tool_names.append(td.function.name)
+                claude_options["allowed_tools"] = allowed_tool_names
+                claude_options["permission_mode"] = "bypassPermissions"
+                claude_options["max_turns"] = 1  # Stop after generating tool_use
+                logger.info(
+                    f"Client tools registered: {[td.function.name for td in request_body.tools]}"
+                )
+            elif not request_body.enable_tools:
                 # Disable all tools by using CLAUDE_TOOLS constant
                 claude_options["disallowed_tools"] = CLAUDE_TOOLS
                 claude_options["max_turns"] = 1  # Single turn for Q&A
@@ -963,6 +1193,16 @@ async def chat_completions(
                 # Set permission mode to bypass prompts (required for API/headless usage)
                 claude_options["permission_mode"] = "bypassPermissions"
                 logger.info(f"Tools enabled by user request: {DEFAULT_ALLOWED_TOOLS}")
+
+            preserve_tools = has_client_tools or request_body.enable_tools
+
+            # Re-filter with preserve_tools if needed
+            if preserve_tools:
+                prompt = MessageAdapter.filter_content(prompt, preserve_tools=True)
+                if system_prompt:
+                    system_prompt = MessageAdapter.filter_content(
+                        system_prompt, preserve_tools=True
+                    )
 
             # Collect all chunks
             chunks = []
@@ -975,6 +1215,7 @@ async def chat_completions(
                 disallowed_tools=claude_options.get("disallowed_tools"),
                 permission_mode=claude_options.get("permission_mode"),
                 max_thinking_tokens=claude_options.get("max_thinking_tokens"),
+                mcp_servers=mcp_servers,
                 stream=False,
             ):
                 chunks.append(chunk)
@@ -982,14 +1223,21 @@ async def chat_completions(
             # Extract assistant message (returns ParsedMessage)
             parsed = claude_cli.parse_claude_message(chunks)
 
-            if not parsed.text:
+            # Determine if we have tool calls
+            has_tool_use = bool(parsed.tool_use_blocks)
+
+            if not parsed.text and not has_tool_use:
                 raise HTTPException(status_code=500, detail="No response from Claude Code")
 
-            # Filter out tool usage (preserve thinking for separate handling)
-            assistant_content = MessageAdapter.filter_content(parsed.text, preserve_thinking=True)
+            # Filter text content
+            assistant_content = ""
+            if parsed.text:
+                assistant_content = MessageAdapter.filter_content(
+                    parsed.text, preserve_thinking=True, preserve_tools=preserve_tools
+                )
 
             # Add assistant response to session if using session mode
-            if actual_session_id:
+            if actual_session_id and assistant_content:
                 assistant_message = Message(role="assistant", content=assistant_content)
                 session_manager.add_assistant_response(actual_session_id, assistant_message)
 
@@ -997,10 +1245,27 @@ async def chat_completions(
             prompt_tokens = MessageAdapter.estimate_tokens(prompt)
             completion_tokens = MessageAdapter.estimate_tokens(assistant_content)
 
-            # Build response message with optional reasoning_content
-            response_message = Message(role="assistant", content=assistant_content)
+            # Build response message with optional reasoning_content and tool_calls
+            response_message = Message(role="assistant", content=assistant_content or None)
             if parsed.reasoning:
                 response_message.reasoning_content = parsed.reasoning
+
+            # Convert tool_use_blocks to OpenAI tool_calls format
+            finish_reason = "stop"
+            if has_tool_use:
+                tool_calls_list = []
+                for tu in parsed.tool_use_blocks:
+                    tool_calls_list.append(
+                        ToolCall(
+                            id=tu.id,
+                            function=FunctionCall(
+                                name=tu.name,
+                                arguments=json.dumps(tu.input),
+                            ),
+                        )
+                    )
+                response_message.tool_calls = tool_calls_list
+                finish_reason = "tool_calls"
 
             # Create response
             response = ChatCompletionResponse(
@@ -1010,7 +1275,7 @@ async def chat_completions(
                     Choice(
                         index=0,
                         message=response_message,
-                        finish_reason="stop",
+                        finish_reason=finish_reason,
                     )
                 ],
                 usage=Usage(
@@ -1079,32 +1344,61 @@ async def anthropic_messages(
         prompt_parts = []
         for msg in messages:
             if msg.role == "user":
-                prompt_parts.append(msg.content)
+                prompt_parts.append(msg.content if msg.content else "")
             elif msg.role == "assistant":
-                prompt_parts.append(f"Assistant: {msg.content}")
+                prompt_parts.append(f"Assistant: {msg.content if msg.content else ''}")
 
         prompt = "\n\n".join(prompt_parts)
         system_prompt = request_body.system
 
+        # Include tool_result context from conversation history
+        tool_result_context = request_body.get_tool_result_context()
+        if tool_result_context:
+            prompt = f"{prompt}\n\n{tool_result_context}"
+
+        # Determine if client tools are present
+        has_client_tools = bool(request_body.tools)
+        preserve_tools = has_client_tools
+
         # Filter content
-        prompt = MessageAdapter.filter_content(prompt)
+        prompt = MessageAdapter.filter_content(prompt, preserve_tools=preserve_tools)
         if system_prompt:
-            system_prompt = MessageAdapter.filter_content(system_prompt)
+            system_prompt = MessageAdapter.filter_content(
+                system_prompt, preserve_tools=preserve_tools
+            )
 
         # Get max_thinking_tokens from thinking config (defaults to high)
         max_thinking_tokens = request_body.get_max_thinking_tokens()
 
+        # Set up SDK options
+        allowed_tools = list(DEFAULT_ALLOWED_TOOLS)
+        max_turns = 10
+        mcp_servers = None
+
+        # Handle client-defined tools
+        if has_client_tools:
+            bridge_defs = anthropic_tool_defs_to_bridge_format(request_body.tools)
+            mcp_server = create_client_tools_mcp_server(bridge_defs)
+            mcp_servers = [mcp_server]
+            # Add client tool names to allowed_tools
+            for td in request_body.tools:
+                if td.name not in allowed_tools:
+                    allowed_tools.append(td.name)
+            # Force max_turns=1 so SDK stops after generating tool_use
+            max_turns = 1
+            logger.info(f"Client tools registered: {[td.name for td in request_body.tools]}")
+
         # Run Claude Code - tools enabled by default for Anthropic SDK clients
-        # (they're typically using this for agentic workflows)
         chunks = []
         async for chunk in claude_cli.run_completion(
             prompt=prompt,
             system_prompt=system_prompt,
             model=request_body.model,
-            max_turns=10,
-            allowed_tools=DEFAULT_ALLOWED_TOOLS,
+            max_turns=max_turns,
+            allowed_tools=allowed_tools,
             permission_mode="bypassPermissions",
             max_thinking_tokens=max_thinking_tokens,
+            mcp_servers=mcp_servers,
             stream=False,
         ):
             chunks.append(chunk)
@@ -1112,30 +1406,47 @@ async def anthropic_messages(
         # Extract assistant message (returns ParsedMessage)
         parsed = claude_cli.parse_claude_message(chunks)
 
-        if not parsed.text:
+        # Determine stop_reason based on tool_use presence
+        has_tool_use = bool(parsed.tool_use_blocks)
+        stop_reason = "tool_use" if has_tool_use else "end_turn"
+
+        # If no text and no tool_use, error
+        if not parsed.text and not has_tool_use:
             raise HTTPException(status_code=500, detail="No response from Claude Code")
 
-        # Filter out tool usage (preserve thinking for separate handling)
-        assistant_content = MessageAdapter.filter_content(parsed.text, preserve_thinking=True)
+        # Filter text content
+        assistant_content = ""
+        if parsed.text:
+            assistant_content = MessageAdapter.filter_content(
+                parsed.text, preserve_thinking=True, preserve_tools=preserve_tools
+            )
 
         # Estimate tokens
         prompt_tokens = MessageAdapter.estimate_tokens(prompt)
         completion_tokens = MessageAdapter.estimate_tokens(assistant_content)
 
-        # Build content blocks (thinking + text, matching Anthropic API format)
+        # Build content blocks (thinking + text + tool_use)
         content_blocks: list = []
         if parsed.thinking_blocks:
             for tb in parsed.thinking_blocks:
                 content_blocks.append(
                     AnthropicThinkingBlock(thinking=tb.thinking, signature=tb.signature)
                 )
-        content_blocks.append(AnthropicTextBlock(text=assistant_content))
+        if assistant_content:
+            content_blocks.append(AnthropicTextBlock(text=assistant_content))
+        if has_tool_use:
+            for tu in parsed.tool_use_blocks:
+                content_blocks.append(AnthropicToolUseBlock(id=tu.id, name=tu.name, input=tu.input))
+
+        # Ensure at least one content block
+        if not content_blocks:
+            content_blocks.append(AnthropicTextBlock(text=""))
 
         # Create Anthropic-format response
         response = AnthropicMessagesResponse(
             model=request_body.model,
             content=content_blocks,
-            stop_reason="end_turn",
+            stop_reason=stop_reason,
             usage=AnthropicUsage(
                 input_tokens=prompt_tokens,
                 output_tokens=completion_tokens,

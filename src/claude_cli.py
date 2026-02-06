@@ -21,12 +21,32 @@ class ThinkingPart:
 
 
 @dataclass
+class ToolUsePart:
+    """A tool_use block from the SDK response."""
+
+    id: str
+    name: str
+    input: Dict[str, Any]
+
+
+@dataclass
+class ToolResultPart:
+    """A tool_result block from the SDK response."""
+
+    tool_use_id: str
+    content: Optional[str] = None
+    is_error: Optional[bool] = None
+
+
+@dataclass
 class ParsedMessage:
     """Parsed result from Claude Agent SDK messages."""
 
     text: Optional[str] = None
     reasoning: Optional[str] = None
     thinking_blocks: Optional[List[ThinkingPart]] = None
+    tool_use_blocks: Optional[List[ToolUsePart]] = None
+    tool_result_blocks: Optional[List[ToolResultPart]] = None
 
 
 class ClaudeCodeCLI:
@@ -123,6 +143,7 @@ class ClaudeCodeCLI:
         continue_session: bool = False,
         permission_mode: Optional[str] = None,
         max_thinking_tokens: Optional[int] = None,
+        mcp_servers: Optional[List[Any]] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Run Claude Agent using the Python SDK and yield response chunks."""
 
@@ -163,6 +184,10 @@ class ClaudeCodeCLI:
                 # Set max thinking tokens for extended thinking / reasoning
                 if max_thinking_tokens is not None:
                     options.max_thinking_tokens = max_thinking_tokens
+
+                # Set MCP servers for client-defined tools
+                if mcp_servers:
+                    options.mcp_servers = mcp_servers
 
                 # Handle session continuity
                 if continue_session:
@@ -227,6 +252,8 @@ class ClaudeCodeCLI:
         result_text = None
         last_text = None
         thinking_parts = []
+        tool_use_parts = []
+        tool_result_parts = []
 
         for message in messages:
             # Check for ResultMessage with 'result' field (multi-turn completion)
@@ -243,18 +270,67 @@ class ClaudeCodeCLI:
                         thinking_parts.append(
                             ThinkingPart(thinking=block.thinking, signature=signature)
                         )
+                    # Handle ToolUseBlock objects (has name + input + id, no text/thinking)
+                    elif (
+                        hasattr(block, "name")
+                        and hasattr(block, "input")
+                        and hasattr(block, "id")
+                        and not hasattr(block, "text")
+                        and not hasattr(block, "thinking")
+                    ):
+                        tool_use_parts.append(
+                            ToolUsePart(
+                                id=block.id,
+                                name=block.name,
+                                input=block.input if isinstance(block.input, dict) else {},
+                            )
+                        )
+                    # Handle ToolResultBlock objects (has tool_use_id as a real string)
+                    elif hasattr(block, "tool_use_id") and isinstance(block.tool_use_id, str):
+                        content_val = getattr(block, "content", None)
+                        if content_val is not None and not isinstance(content_val, str):
+                            content_val = str(content_val)
+                        tool_result_parts.append(
+                            ToolResultPart(
+                                tool_use_id=block.tool_use_id,
+                                content=content_val,
+                                is_error=getattr(block, "is_error", None),
+                            )
+                        )
                     # Handle TextBlock objects
                     elif hasattr(block, "text"):
                         text_parts.append(block.text)
-                    elif isinstance(block, dict) and block.get("type") == "thinking":
-                        thinking_parts.append(
-                            ThinkingPart(
-                                thinking=block.get("thinking", ""),
-                                signature=block.get("signature"),
+                    # Handle dict-style blocks
+                    elif isinstance(block, dict):
+                        block_type = block.get("type")
+                        if block_type == "thinking":
+                            thinking_parts.append(
+                                ThinkingPart(
+                                    thinking=block.get("thinking", ""),
+                                    signature=block.get("signature"),
+                                )
                             )
-                        )
-                    elif isinstance(block, dict) and block.get("type") == "text":
-                        text_parts.append(block.get("text", ""))
+                        elif block_type == "tool_use":
+                            tool_use_parts.append(
+                                ToolUsePart(
+                                    id=block.get("id", ""),
+                                    name=block.get("name", ""),
+                                    input=block.get("input", {}),
+                                )
+                            )
+                        elif block_type == "tool_result":
+                            content_val = block.get("content")
+                            if content_val is not None and not isinstance(content_val, str):
+                                content_val = str(content_val)
+                            tool_result_parts.append(
+                                ToolResultPart(
+                                    tool_use_id=block.get("tool_use_id", ""),
+                                    content=content_val,
+                                    is_error=block.get("is_error"),
+                                )
+                            )
+                        elif block_type == "text":
+                            text_parts.append(block.get("text", ""))
                     elif isinstance(block, str):
                         text_parts.append(block)
 
@@ -279,6 +355,25 @@ class ClaudeCodeCLI:
                                         signature=block.get("signature"),
                                     )
                                 )
+                            elif isinstance(block, dict) and block.get("type") == "tool_use":
+                                tool_use_parts.append(
+                                    ToolUsePart(
+                                        id=block.get("id", ""),
+                                        name=block.get("name", ""),
+                                        input=block.get("input", {}),
+                                    )
+                                )
+                            elif isinstance(block, dict) and block.get("type") == "tool_result":
+                                content_val = block.get("content")
+                                if content_val is not None and not isinstance(content_val, str):
+                                    content_val = str(content_val)
+                                tool_result_parts.append(
+                                    ToolResultPart(
+                                        tool_use_id=block.get("tool_use_id", ""),
+                                        content=content_val,
+                                        is_error=block.get("is_error"),
+                                    )
+                                )
                         if text_parts:
                             last_text = "\n".join(text_parts)
                     elif isinstance(content, str):
@@ -291,6 +386,8 @@ class ClaudeCodeCLI:
             text=final_text,
             reasoning=reasoning,
             thinking_blocks=thinking_parts if thinking_parts else None,
+            tool_use_blocks=tool_use_parts if tool_use_parts else None,
+            tool_result_blocks=tool_result_parts if tool_result_parts else None,
         )
 
     def extract_metadata(self, messages: List[Dict[str, Any]]) -> Dict[str, Any]:

@@ -23,10 +23,12 @@ class ContentPart(BaseModel):
 
 
 class Message(BaseModel):
-    role: Literal["system", "user", "assistant"]
-    content: Union[str, List[ContentPart]]
+    role: Literal["system", "user", "assistant", "tool"]
+    content: Optional[Union[str, List[ContentPart]]] = None
     name: Optional[str] = None
     reasoning_content: Optional[str] = None
+    tool_calls: Optional[List["ToolCall"]] = None
+    tool_call_id: Optional[str] = None
 
     @model_validator(mode="after")
     def normalize_content(self):
@@ -83,6 +85,14 @@ class ChatCompletionRequest(BaseModel):
     )
     stream_options: Optional[StreamOptions] = Field(
         default=None, description="Options for streaming responses"
+    )
+    tools: Optional[List["ToolDefinition"]] = Field(
+        default=None,
+        description="List of tools the model may call (OpenAI function calling format)",
+    )
+    tool_choice: Optional[Union[str, Dict[str, Any]]] = Field(
+        default=None,
+        description="Controls tool use: 'auto', 'none', 'required', or specific tool",
     )
 
     @field_validator("n")
@@ -206,7 +216,9 @@ class ChatCompletionRequest(BaseModel):
 class Choice(BaseModel):
     index: int
     message: Message
-    finish_reason: Optional[Literal["stop", "length", "content_filter", "null"]] = None
+    finish_reason: Optional[Literal["stop", "length", "content_filter", "tool_calls", "null"]] = (
+        None
+    )
 
 
 class Usage(BaseModel):
@@ -228,7 +240,9 @@ class ChatCompletionResponse(BaseModel):
 class StreamChoice(BaseModel):
     index: int
     delta: Dict[str, Any]
-    finish_reason: Optional[Literal["stop", "length", "content_filter", "null"]] = None
+    finish_reason: Optional[Literal["stop", "length", "content_filter", "tool_calls", "null"]] = (
+        None
+    )
 
 
 class ChatCompletionStreamResponse(BaseModel):
@@ -438,6 +452,75 @@ class AnthropicThinkingBlock(BaseModel):
     )
 
 
+class AnthropicToolUseBlock(BaseModel):
+    """Anthropic tool_use content block."""
+
+    type: Literal["tool_use"] = "tool_use"
+    id: str
+    name: str
+    input: Dict[str, Any]
+
+
+class AnthropicToolResultBlock(BaseModel):
+    """Anthropic tool_result content block."""
+
+    type: Literal["tool_result"] = "tool_result"
+    tool_use_id: str
+    content: Optional[Union[str, List[Dict[str, Any]]]] = None
+    is_error: Optional[bool] = None
+
+
+class AnthropicToolInputSchema(BaseModel):
+    """Anthropic tool input schema definition."""
+
+    type: Literal["object"] = "object"
+    properties: Dict[str, Any] = Field(default_factory=dict)
+    required: Optional[List[str]] = None
+
+
+class AnthropicToolDefinition(BaseModel):
+    """Anthropic tool definition."""
+
+    name: str
+    description: Optional[str] = None
+    input_schema: AnthropicToolInputSchema
+
+
+# ============================================================================
+# OpenAI Tool/Function Calling Models
+# ============================================================================
+
+
+class FunctionDefinition(BaseModel):
+    """OpenAI function definition within a tool."""
+
+    name: str
+    description: Optional[str] = None
+    parameters: Optional[Dict[str, Any]] = None
+
+
+class ToolDefinition(BaseModel):
+    """OpenAI tool definition."""
+
+    type: Literal["function"] = "function"
+    function: FunctionDefinition
+
+
+class FunctionCall(BaseModel):
+    """OpenAI function call in assistant response."""
+
+    name: str
+    arguments: str  # JSON string
+
+
+class ToolCall(BaseModel):
+    """OpenAI tool call in assistant response."""
+
+    id: str
+    type: Literal["function"] = "function"
+    function: FunctionCall
+
+
 class AnthropicThinkingConfig(BaseModel):
     """Anthropic extended thinking configuration."""
 
@@ -451,26 +534,32 @@ class AnthropicMessage(BaseModel):
     """Anthropic message format."""
 
     role: Literal["user", "assistant"]
-    content: Union[str, List[AnthropicTextBlock]]
+    content: Union[
+        str,
+        List[Union[AnthropicTextBlock, AnthropicToolUseBlock, AnthropicToolResultBlock]],
+    ]
 
     @field_validator("content", mode="before")
     @classmethod
     def filter_content_blocks(cls, v):
-        """Accept content arrays with thinking/tool_use blocks by keeping only text blocks.
+        """Accept content arrays with thinking/tool_use/tool_result blocks.
 
-        When extended thinking is enabled, assistant messages in conversation history
-        contain thinking blocks alongside text blocks. We strip non-text blocks so
-        Pydantic validation succeeds.
+        Keeps text, tool_use, and tool_result blocks. Strips thinking and
+        other unsupported block types so Pydantic validation succeeds.
         """
         if isinstance(v, list):
             filtered = []
             for item in v:
                 if isinstance(item, dict):
-                    if item.get("type") == "text":
+                    block_type = item.get("type")
+                    if block_type in ("text", "tool_use", "tool_result"):
                         filtered.append(item)
-                elif isinstance(item, AnthropicTextBlock):
+                    # skip thinking and other non-supported block types
+                elif isinstance(
+                    item, (AnthropicTextBlock, AnthropicToolUseBlock, AnthropicToolResultBlock)
+                ):
                     filtered.append(item)
-                # skip thinking, tool_use, and other non-text block types
+                # skip thinking and other non-supported block types
             return filtered
         return v
 
@@ -497,6 +586,7 @@ class AnthropicMessagesRequest(BaseModel):
                     parts.append(block.get("text", ""))
             return "\n\n".join(parts) if parts else None
         return v
+
     top_p: Optional[float] = Field(default=None, ge=0, le=1)
     top_k: Optional[int] = Field(default=None, ge=0)
     stop_sequences: Optional[List[str]] = None
@@ -504,6 +594,12 @@ class AnthropicMessagesRequest(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
     thinking: Optional[AnthropicThinkingConfig] = Field(
         default=None, description="Extended thinking configuration"
+    )
+    tools: Optional[List[AnthropicToolDefinition]] = Field(
+        default=None, description="List of tools the model may call"
+    )
+    tool_choice: Optional[Union[str, Dict[str, Any]]] = Field(
+        default=None, description="Controls tool use: 'auto', 'any', or specific tool"
     )
 
     def get_max_thinking_tokens(self) -> Optional[int]:
@@ -527,9 +623,26 @@ class AnthropicMessagesRequest(BaseModel):
                 text_parts = [
                     block.text for block in content if isinstance(block, AnthropicTextBlock)
                 ]
-                content = "\n".join(text_parts)
+                content = "\n".join(text_parts) if text_parts else ""
             result.append(Message(role=msg.role, content=content))
         return result
+
+    def get_tool_result_context(self) -> Optional[str]:
+        """Extract tool_result blocks from messages and format as context text.
+
+        Returns a text representation of tool results for inclusion in the prompt.
+        """
+        tool_results = []
+        for msg in self.messages:
+            if isinstance(msg.content, list):
+                for block in msg.content:
+                    if isinstance(block, AnthropicToolResultBlock):
+                        content_text = block.content if isinstance(block.content, str) else ""
+                        error_note = " [ERROR]" if block.is_error else ""
+                        tool_results.append(
+                            f"Tool result (id={block.tool_use_id}){error_note}: {content_text}"
+                        )
+        return "\n".join(tool_results) if tool_results else None
 
 
 class AnthropicCacheCreation(BaseModel):
@@ -558,9 +671,14 @@ class AnthropicMessagesResponse(BaseModel):
     id: str = Field(default_factory=lambda: f"msg_{uuid.uuid4().hex[:24]}")
     type: Literal["message"] = "message"
     role: Literal["assistant"] = "assistant"
-    content: List[Union[AnthropicThinkingBlock, AnthropicTextBlock]]
+    content: List[Union[AnthropicThinkingBlock, AnthropicTextBlock, AnthropicToolUseBlock]]
     stop_reason: Optional[Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"]] = (
         "end_turn"
     )
     stop_sequence: Optional[str] = None
     usage: AnthropicUsage
+
+
+# Rebuild forward references now that ToolCall is defined
+Message.model_rebuild()
+ChatCompletionRequest.model_rebuild()
