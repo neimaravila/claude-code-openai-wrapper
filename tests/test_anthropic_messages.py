@@ -124,7 +124,14 @@ class TestAnthropicMessagesEndpoint:
         assert result["role"] == "assistant"
         assert "content" in result
         assert len(result["content"]) > 0
-        assert result["content"][0]["type"] == "text"
+        # Find the text block (may be preceded by a thinking block)
+        text_blocks = [b for b in result["content"] if b["type"] == "text"]
+        assert len(text_blocks) > 0, "Response must contain at least one text block"
+        # Thinking blocks should have required fields if present
+        thinking_blocks = [b for b in result["content"] if b["type"] == "thinking"]
+        for tb in thinking_blocks:
+            assert "thinking" in tb
+            assert "signature" in tb
         assert "usage" in result
         assert "input_tokens" in result["usage"]
         assert "output_tokens" in result["usage"]
@@ -166,8 +173,10 @@ class TestAnthropicMessagesEndpoint:
         assert response.status_code == 200
         result = response.json()
         assert result["type"] == "message"
-        # The response should reference Alice
-        response_text = result["content"][0]["text"].lower()
+        # The response should reference Alice (find the text block)
+        text_blocks = [b for b in result["content"] if b["type"] == "text"]
+        assert len(text_blocks) > 0
+        response_text = text_blocks[0]["text"].lower()
         assert "alice" in response_text
 
     @requires_server
