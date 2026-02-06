@@ -389,6 +389,230 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     return JSONResponse(status_code=422, content=error_response)
 
 
+def anthropic_sse(event_type: str, data: dict) -> str:
+    """Format a Server-Sent Event in Anthropic's named-event style."""
+    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+
+
+async def generate_anthropic_streaming_response(
+    request_body: AnthropicMessagesRequest,
+) -> AsyncGenerator[str, None]:
+    """Generate SSE formatted streaming response in Anthropic Messages API format."""
+    try:
+        # Convert Anthropic messages to internal format
+        messages = request_body.to_openai_messages()
+
+        # Build prompt from messages
+        prompt_parts = []
+        for msg in messages:
+            if msg.role == "user":
+                prompt_parts.append(msg.content)
+            elif msg.role == "assistant":
+                prompt_parts.append(f"Assistant: {msg.content}")
+
+        prompt = "\n\n".join(prompt_parts)
+        system_prompt = request_body.system
+
+        # Filter content
+        prompt = MessageAdapter.filter_content(prompt)
+        if system_prompt:
+            system_prompt = MessageAdapter.filter_content(system_prompt)
+
+        # Get max_thinking_tokens from thinking config
+        max_thinking_tokens = request_body.get_max_thinking_tokens()
+
+        # Estimate input tokens
+        input_tokens = MessageAdapter.estimate_tokens(prompt)
+
+        # Emit message_start
+        msg_id = f"msg_{os.urandom(12).hex()}"
+        yield anthropic_sse(
+            "message_start",
+            {
+                "type": "message_start",
+                "message": {
+                    "id": msg_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": request_body.model,
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": input_tokens, "output_tokens": 1},
+                },
+            },
+        )
+
+        block_index = 0
+        output_text = ""
+
+        async for chunk in claude_cli.run_completion(
+            prompt=prompt,
+            system_prompt=system_prompt,
+            model=request_body.model,
+            max_turns=10,
+            allowed_tools=DEFAULT_ALLOWED_TOOLS,
+            permission_mode="bypassPermissions",
+            max_thinking_tokens=max_thinking_tokens,
+            stream=True,
+        ):
+            # Extract content from chunk (same logic as OpenAI streaming)
+            content = None
+            if chunk.get("type") == "assistant" and "message" in chunk:
+                message = chunk["message"]
+                if isinstance(message, dict) and "content" in message:
+                    content = message["content"]
+            elif "content" in chunk and isinstance(chunk["content"], list):
+                content = chunk["content"]
+
+            if content is None:
+                continue
+
+            if not isinstance(content, list):
+                continue
+
+            for block in content:
+                # ThinkingBlock (has .thinking attribute)
+                if hasattr(block, "thinking"):
+                    # content_block_start
+                    yield anthropic_sse(
+                        "content_block_start",
+                        {
+                            "type": "content_block_start",
+                            "index": block_index,
+                            "content_block": {"type": "thinking", "thinking": ""},
+                        },
+                    )
+                    # thinking_delta
+                    yield anthropic_sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": block_index,
+                            "delta": {"type": "thinking_delta", "thinking": block.thinking},
+                        },
+                    )
+                    # signature_delta (if present)
+                    if hasattr(block, "signature") and block.signature:
+                        yield anthropic_sse(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": block_index,
+                                "delta": {"type": "signature_delta", "signature": block.signature},
+                            },
+                        )
+                    # content_block_stop
+                    yield anthropic_sse(
+                        "content_block_stop",
+                        {"type": "content_block_stop", "index": block_index},
+                    )
+                    block_index += 1
+                    continue
+
+                # Dict-style thinking block
+                if isinstance(block, dict) and block.get("type") == "thinking":
+                    yield anthropic_sse(
+                        "content_block_start",
+                        {
+                            "type": "content_block_start",
+                            "index": block_index,
+                            "content_block": {"type": "thinking", "thinking": ""},
+                        },
+                    )
+                    yield anthropic_sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": block_index,
+                            "delta": {
+                                "type": "thinking_delta",
+                                "thinking": block.get("thinking", ""),
+                            },
+                        },
+                    )
+                    if block.get("signature"):
+                        yield anthropic_sse(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": block_index,
+                                "delta": {
+                                    "type": "signature_delta",
+                                    "signature": block["signature"],
+                                },
+                            },
+                        )
+                    yield anthropic_sse(
+                        "content_block_stop",
+                        {"type": "content_block_stop", "index": block_index},
+                    )
+                    block_index += 1
+                    continue
+
+                # TextBlock (has .text attribute or dict with type=text)
+                if hasattr(block, "text"):
+                    raw_text = block.text
+                elif isinstance(block, dict) and block.get("type") == "text":
+                    raw_text = block.get("text", "")
+                else:
+                    continue
+
+                filtered_text = MessageAdapter.filter_content(raw_text, preserve_thinking=True)
+                if not filtered_text or filtered_text.isspace():
+                    continue
+
+                output_text += filtered_text
+
+                # content_block_start
+                yield anthropic_sse(
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": block_index,
+                        "content_block": {"type": "text", "text": ""},
+                    },
+                )
+                # text_delta
+                yield anthropic_sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": block_index,
+                        "delta": {"type": "text_delta", "text": filtered_text},
+                    },
+                )
+                # content_block_stop
+                yield anthropic_sse(
+                    "content_block_stop",
+                    {"type": "content_block_stop", "index": block_index},
+                )
+                block_index += 1
+
+        # Estimate output tokens
+        output_tokens = MessageAdapter.estimate_tokens(output_text) if output_text else 1
+
+        # Emit message_delta with stop_reason
+        yield anthropic_sse(
+            "message_delta",
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "usage": {"output_tokens": output_tokens},
+            },
+        )
+
+        # Emit message_stop
+        yield anthropic_sse("message_stop", {"type": "message_stop"})
+
+    except Exception as e:
+        logger.error(f"Anthropic streaming error: {e}")
+        yield anthropic_sse(
+            "error",
+            {"type": "error", "error": {"type": "api_error", "message": str(e)}},
+        )
+
+
 async def generate_streaming_response(
     request: ChatCompletionRequest, request_id: str, claude_headers: Optional[Dict[str, Any]] = None
 ) -> AsyncGenerator[str, None]:
@@ -833,7 +1057,20 @@ async def anthropic_messages(
         raise HTTPException(status_code=503, detail=error_detail)
 
     try:
-        logger.info(f"Anthropic Messages API request: model={request_body.model}")
+        logger.info(
+            f"Anthropic Messages API request: model={request_body.model}, stream={request_body.stream}"
+        )
+
+        # Handle streaming
+        if request_body.stream:
+            return StreamingResponse(
+                generate_anthropic_streaming_response(request_body),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                },
+            )
 
         # Convert Anthropic messages to internal format
         messages = request_body.to_openai_messages()
