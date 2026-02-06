@@ -791,6 +791,17 @@ async def generate_streaming_response(
                 system_prompt = sampling_instructions
             logger.debug(f"Added sampling instructions: {sampling_instructions}")
 
+        # Add structured output instructions from response_format if present
+        structured_instructions = request.get_structured_output_instructions()
+        if structured_instructions:
+            if system_prompt:
+                system_prompt = f"{system_prompt}\n\n{structured_instructions}"
+            else:
+                system_prompt = structured_instructions
+            logger.debug(
+                f"Added structured output instructions for type={request.response_format.type}"
+            )
+
         # Filter content for unsupported features
         prompt = MessageAdapter.filter_content(prompt)
         if system_prompt:
@@ -1229,6 +1240,17 @@ async def chat_completions(
                 else:
                     system_prompt = sampling_instructions
                 logger.debug(f"Added sampling instructions: {sampling_instructions}")
+
+            # Add structured output instructions from response_format if present
+            structured_instructions = request_body.get_structured_output_instructions()
+            if structured_instructions:
+                if system_prompt:
+                    system_prompt = f"{system_prompt}\n\n{structured_instructions}"
+                else:
+                    system_prompt = structured_instructions
+                logger.debug(
+                    f"Added structured output instructions for type={request_body.response_format.type}"
+                )
 
             # Filter content
             prompt = MessageAdapter.filter_content(prompt)

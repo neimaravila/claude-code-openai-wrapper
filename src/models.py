@@ -1,6 +1,7 @@
 from typing import List, Optional, Dict, Any, Union, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 from datetime import datetime
+import json
 import uuid
 import logging
 
@@ -56,6 +57,24 @@ class StreamOptions(BaseModel):
     )
 
 
+class ResponseFormatJsonSchema(BaseModel):
+    """JSON Schema specification for structured output."""
+
+    name: str
+    description: Optional[str] = None
+    schema_: Optional[Dict[str, Any]] = Field(default=None, alias="schema")
+    strict: Optional[bool] = None
+
+    model_config = {"populate_by_name": True}
+
+
+class ResponseFormat(BaseModel):
+    """Output format specification (OpenAI compatible)."""
+
+    type: Literal["text", "json_object", "json_schema"] = "text"
+    json_schema: Optional[ResponseFormatJsonSchema] = None
+
+
 class ChatCompletionRequest(BaseModel):
     model: str = Field(default_factory=get_default_model)
     messages: List[Message]
@@ -94,6 +113,41 @@ class ChatCompletionRequest(BaseModel):
         default=None,
         description="Controls tool use: 'auto', 'none', 'required', or specific tool",
     )
+    response_format: Optional[ResponseFormat] = Field(
+        default=None, description="Output format: 'text', 'json_object', or 'json_schema'"
+    )
+
+    @model_validator(mode="after")
+    def validate_response_format(self):
+        """Validate response_format constraints."""
+        if self.response_format is None or self.response_format.type == "text":
+            return self
+
+        if self.response_format.type == "json_object":
+            # OpenAI requires "json" to appear in a system or user message
+            has_json_mention = False
+            for msg in self.messages:
+                if msg.role in ("system", "user") and msg.content:
+                    if "json" in msg.content.lower():
+                        has_json_mention = True
+                        break
+            if not has_json_mention:
+                raise ValueError(
+                    "When using response_format type 'json_object', you must include the word "
+                    "'json' in a system or user message to instruct the model to output JSON."
+                )
+
+        if self.response_format.type == "json_schema":
+            if (
+                self.response_format.json_schema is None
+                or self.response_format.json_schema.schema_ is None
+            ):
+                raise ValueError(
+                    "When using response_format type 'json_schema', "
+                    "you must provide a json_schema with a schema definition."
+                )
+
+        return self
 
     @field_validator("n")
     @classmethod
@@ -140,6 +194,12 @@ class ChatCompletionRequest(BaseModel):
         if self.stop:
             warnings.append("stop sequences are not supported and will be ignored")
 
+        if self.response_format and self.response_format.type != "text":
+            info_messages.append(
+                f"response_format type='{self.response_format.type}' "
+                f"will be applied via system prompt (best-effort)"
+            )
+
         for msg in info_messages:
             logger.info(f"OpenAI API compatibility: {msg}")
 
@@ -183,6 +243,42 @@ class ChatCompletionRequest(BaseModel):
                 )
 
         return " ".join(instructions) if instructions else None
+
+    def get_structured_output_instructions(self) -> Optional[str]:
+        """Generate system prompt instructions for structured JSON output.
+
+        Returns instructions based on response_format type:
+        - text or None: returns None
+        - json_object: instructs model to output valid JSON
+        - json_schema: instructs model to output JSON matching the provided schema
+        """
+        if self.response_format is None or self.response_format.type == "text":
+            return None
+
+        if self.response_format.type == "json_object":
+            return (
+                "You MUST respond with valid JSON only. "
+                "Do not include any text, explanations, or markdown formatting outside the JSON. "
+                "Your entire response must be a single valid JSON object."
+            )
+
+        if self.response_format.type == "json_schema":
+            schema_def = self.response_format.json_schema
+            parts = [
+                f"You MUST respond with valid JSON that conforms to the schema named "
+                f'"{schema_def.name}".'
+            ]
+            if schema_def.description:
+                parts.append(f"Description: {schema_def.description}")
+            parts.append(f"JSON Schema:\n{json.dumps(schema_def.schema_, indent=2)}")
+            parts.append(
+                "Your entire response must be a single valid JSON object matching this schema. "
+                "Do not include any text, explanations, or markdown formatting outside the JSON. "
+                "Respect all required fields, types, and constraints defined in the schema."
+            )
+            return "\n\n".join(parts)
+
+        return None
 
     def to_claude_options(self) -> Dict[str, Any]:
         """Convert OpenAI request parameters to Claude Code SDK options."""

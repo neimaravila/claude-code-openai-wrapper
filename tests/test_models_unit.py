@@ -39,6 +39,8 @@ from src.models import (
     AnthropicMessagesRequest,
     AnthropicUsage,
     AnthropicMessagesResponse,
+    ResponseFormat,
+    ResponseFormatJsonSchema,
 )
 
 
@@ -622,3 +624,147 @@ class TestAnthropicModels:
         assert response.role == "assistant"
         assert response.stop_reason == "end_turn"
         assert response.id.startswith("msg_")
+
+
+class TestResponseFormat:
+    """Test ResponseFormat and structured output support."""
+
+    def test_response_format_defaults_to_none(self):
+        """response_format defaults to None on ChatCompletionRequest."""
+        request = ChatCompletionRequest(messages=[Message(role="user", content="Hi")])
+        assert request.response_format is None
+
+    def test_response_format_type_text(self):
+        """type='text' is accepted and produces no instructions."""
+        request = ChatCompletionRequest(
+            messages=[Message(role="user", content="Hi")],
+            response_format=ResponseFormat(type="text"),
+        )
+        assert request.response_format.type == "text"
+        assert request.get_structured_output_instructions() is None
+
+    def test_response_format_json_object_valid(self):
+        """type='json_object' accepted when 'json' appears in messages."""
+        request = ChatCompletionRequest(
+            messages=[Message(role="user", content="Return as json")],
+            response_format=ResponseFormat(type="json_object"),
+        )
+        assert request.response_format.type == "json_object"
+
+    def test_response_format_json_object_system_mention(self):
+        """type='json_object' accepted when 'json' appears in system message."""
+        request = ChatCompletionRequest(
+            messages=[
+                Message(role="system", content="Always output JSON"),
+                Message(role="user", content="List colors"),
+            ],
+            response_format=ResponseFormat(type="json_object"),
+        )
+        assert request.response_format.type == "json_object"
+
+    def test_response_format_json_object_no_json_mention(self):
+        """type='json_object' rejected when 'json' not in messages."""
+        with pytest.raises(ValueError, match="include the word 'json'"):
+            ChatCompletionRequest(
+                messages=[Message(role="user", content="List colors")],
+                response_format=ResponseFormat(type="json_object"),
+            )
+
+    def test_response_format_json_schema_valid(self):
+        """type='json_schema' accepted with schema provided."""
+        request = ChatCompletionRequest(
+            messages=[Message(role="user", content="Extract info")],
+            response_format=ResponseFormat(
+                type="json_schema",
+                json_schema=ResponseFormatJsonSchema(
+                    name="city_info",
+                    **{"schema": {"type": "object", "properties": {"name": {"type": "string"}}}},
+                ),
+            ),
+        )
+        assert request.response_format.type == "json_schema"
+
+    def test_response_format_json_schema_no_schema(self):
+        """type='json_schema' rejected without schema."""
+        with pytest.raises(ValueError, match="must provide a json_schema"):
+            ChatCompletionRequest(
+                messages=[Message(role="user", content="Extract info")],
+                response_format=ResponseFormat(
+                    type="json_schema",
+                    json_schema=ResponseFormatJsonSchema(name="test"),
+                ),
+            )
+
+    def test_response_format_json_schema_no_json_schema_field(self):
+        """type='json_schema' rejected without json_schema field at all."""
+        with pytest.raises(ValueError, match="must provide a json_schema"):
+            ChatCompletionRequest(
+                messages=[Message(role="user", content="Extract info")],
+                response_format=ResponseFormat(type="json_schema"),
+            )
+
+    def test_get_structured_output_instructions_json_object(self):
+        """json_object produces JSON-only instructions."""
+        request = ChatCompletionRequest(
+            messages=[Message(role="user", content="Return as json")],
+            response_format=ResponseFormat(type="json_object"),
+        )
+        instructions = request.get_structured_output_instructions()
+        assert instructions is not None
+        assert "valid JSON" in instructions
+        assert "single valid JSON object" in instructions
+
+    def test_get_structured_output_instructions_json_schema(self):
+        """json_schema produces instructions with schema details."""
+        schema = {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+        }
+        request = ChatCompletionRequest(
+            messages=[Message(role="user", content="Extract info")],
+            response_format=ResponseFormat(
+                type="json_schema",
+                json_schema=ResponseFormatJsonSchema(
+                    name="city_info",
+                    **{"schema": schema},
+                ),
+            ),
+        )
+        instructions = request.get_structured_output_instructions()
+        assert instructions is not None
+        assert '"city_info"' in instructions
+        assert '"name"' in instructions
+        assert "required" in instructions
+
+    def test_get_structured_output_instructions_json_schema_with_description(self):
+        """json_schema instructions include description when provided."""
+        request = ChatCompletionRequest(
+            messages=[Message(role="user", content="Extract info")],
+            response_format=ResponseFormat(
+                type="json_schema",
+                json_schema=ResponseFormatJsonSchema(
+                    name="city_info",
+                    description="Information about a city",
+                    **{"schema": {"type": "object", "properties": {}}},
+                ),
+            ),
+        )
+        instructions = request.get_structured_output_instructions()
+        assert "Information about a city" in instructions
+
+    def test_get_structured_output_instructions_none(self):
+        """No response_format produces no instructions."""
+        request = ChatCompletionRequest(messages=[Message(role="user", content="Hi")])
+        assert request.get_structured_output_instructions() is None
+
+    def test_log_parameter_info_response_format(self):
+        """log_parameter_info logs response_format when not text."""
+        request = ChatCompletionRequest(
+            messages=[Message(role="user", content="Return as json")],
+            response_format=ResponseFormat(type="json_object"),
+        )
+        with patch("src.models.logger") as mock_logger:
+            request.log_parameter_info()
+            info_calls = [str(call) for call in mock_logger.info.call_args_list]
+            assert any("response_format" in c for c in info_calls)
