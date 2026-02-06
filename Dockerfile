@@ -5,17 +5,19 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Poetry globally
-RUN curl -sSL https://install.python-poetry.org | python3 -
+# Create non-root user (Claude Code refuses --dangerously-skip-permissions as root)
+RUN groupadd -r appuser && useradd -r -g appuser -m -s /bin/bash appuser
 
-# Add Poetry to PATH
-ENV PATH="/root/.local/bin:${PATH}"
+# Install Poetry for appuser
+USER appuser
+RUN curl -sSL https://install.python-poetry.org | python3 -
+ENV PATH="/home/appuser/.local/bin:${PATH}"
 
 # Note: Claude Code CLI is bundled with claude-agent-sdk >= 0.1.8
 # No separate Node.js/npm installation required
 
 # Copy the app code
-COPY . /app
+COPY --chown=appuser:appuser . /app
 
 # Set working directory
 WORKDIR /app
