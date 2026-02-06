@@ -905,7 +905,8 @@ async def anthropic_messages(
             ),
         )
 
-        return JSONResponse(content=response.model_dump(exclude_none=True))
+        # Anthropic API always includes stop_sequence (even as null), so don't exclude_none
+        return JSONResponse(content=response.model_dump())
 
     except HTTPException:
         raise
