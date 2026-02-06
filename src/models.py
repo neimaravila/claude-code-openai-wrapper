@@ -453,6 +453,27 @@ class AnthropicMessage(BaseModel):
     role: Literal["user", "assistant"]
     content: Union[str, List[AnthropicTextBlock]]
 
+    @field_validator("content", mode="before")
+    @classmethod
+    def filter_content_blocks(cls, v):
+        """Accept content arrays with thinking/tool_use blocks by keeping only text blocks.
+
+        When extended thinking is enabled, assistant messages in conversation history
+        contain thinking blocks alongside text blocks. We strip non-text blocks so
+        Pydantic validation succeeds.
+        """
+        if isinstance(v, list):
+            filtered = []
+            for item in v:
+                if isinstance(item, dict):
+                    if item.get("type") == "text":
+                        filtered.append(item)
+                elif isinstance(item, AnthropicTextBlock):
+                    filtered.append(item)
+                # skip thinking, tool_use, and other non-text block types
+            return filtered
+        return v
+
 
 class AnthropicMessagesRequest(BaseModel):
     """Anthropic Messages API request format."""
