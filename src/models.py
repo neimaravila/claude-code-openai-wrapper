@@ -460,8 +460,22 @@ class AnthropicMessagesRequest(BaseModel):
     model: str
     messages: List[AnthropicMessage]
     max_tokens: int = Field(default=4096, description="Maximum tokens to generate")
-    system: Optional[str] = Field(default=None, description="System prompt")
+    system: Optional[Union[str, List[Dict[str, Any]]]] = Field(
+        default=None, description="System prompt (string or array of content blocks)"
+    )
     temperature: Optional[float] = Field(default=1.0, ge=0, le=1)
+
+    @field_validator("system", mode="before")
+    @classmethod
+    def normalize_system(cls, v):
+        """Convert array-of-content-blocks system prompt to a plain string."""
+        if isinstance(v, list):
+            parts = []
+            for block in v:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    parts.append(block.get("text", ""))
+            return "\n\n".join(parts) if parts else None
+        return v
     top_p: Optional[float] = Field(default=None, ge=0, le=1)
     top_k: Optional[int] = Field(default=None, ge=0)
     stop_sequences: Optional[List[str]] = None
