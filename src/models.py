@@ -497,23 +497,33 @@ class AnthropicMessagesRequest(BaseModel):
         return result
 
 
+class AnthropicCacheCreation(BaseModel):
+    """Anthropic cache creation breakdown."""
+
+    ephemeral_5m_input_tokens: int = 0
+    ephemeral_1h_input_tokens: int = 0
+
+
 class AnthropicUsage(BaseModel):
     """Anthropic usage information."""
 
     input_tokens: int
-    output_tokens: int
     cache_creation_input_tokens: int = 0
     cache_read_input_tokens: int = 0
+    cache_creation: AnthropicCacheCreation = Field(default_factory=AnthropicCacheCreation)
+    output_tokens: int
+    service_tier: str = "standard"
+    inference_geo: str = "global"
 
 
 class AnthropicMessagesResponse(BaseModel):
     """Anthropic Messages API response format."""
 
+    model: str
     id: str = Field(default_factory=lambda: f"msg_{uuid.uuid4().hex[:24]}")
     type: Literal["message"] = "message"
     role: Literal["assistant"] = "assistant"
     content: List[Union[AnthropicThinkingBlock, AnthropicTextBlock]]
-    model: str
     stop_reason: Optional[Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"]] = (
         "end_turn"
     )
