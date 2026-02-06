@@ -479,11 +479,24 @@ class AnthropicToolInputSchema(BaseModel):
 
 
 class AnthropicToolDefinition(BaseModel):
-    """Anthropic tool definition."""
+    """Anthropic tool definition.
+
+    Supports both custom tools (with input_schema) and built-in tools
+    like web_search_20250305, text_editor_20250124, etc.
+    Built-in tools have a type field and no input_schema.
+    """
+
+    model_config = {"extra": "allow"}
 
     name: str
+    type: Optional[str] = None
     description: Optional[str] = None
-    input_schema: AnthropicToolInputSchema
+    input_schema: Optional[AnthropicToolInputSchema] = None
+
+    @property
+    def is_custom_tool(self) -> bool:
+        """Return True if this is a custom tool (has input_schema), not a built-in."""
+        return self.input_schema is not None
 
 
 # ============================================================================

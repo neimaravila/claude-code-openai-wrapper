@@ -1,98 +1,148 @@
-"""Bridge between client-defined tools and the Claude Agent SDK MCP server.
+"""Bridge between client-defined tools and the Claude Agent SDK.
 
-Uses create_sdk_mcp_server() to register client tools as in-process MCP tools.
-Each tool has a stub handler that returns a sentinel value, because with max_turns=1
-the SDK stops after generating a ToolUseBlock and returns it to the client.
-The client then executes the tool and sends the result back in the next request.
+Since the SDK runs Claude as a subprocess, we cannot use in-process MCP servers.
+Instead, we describe tools in the system prompt and parse Claude's response
+for tool call patterns, converting them into proper ToolUseBlock format.
+
+The flow:
+1. Client sends tool definitions in the request
+2. We append tool descriptions to the system prompt
+3. Claude responds with tool call JSON (it naturally does this for described tools)
+4. We parse the JSON from the response text
+5. Return proper ToolUsePart objects to the caller
 """
 
+import json
 import logging
+import re
+import uuid
 from typing import Any, Dict, List, Optional
-
-from claude_agent_sdk import create_sdk_mcp_server, tool
 
 logger = logging.getLogger(__name__)
 
-# Sentinel value returned by stub handlers
-PENDING_CLIENT_EXECUTION = "[PENDING_CLIENT_EXECUTION]"
+
+# ============================================================================
+# System prompt generation
+# ============================================================================
+
+TOOL_SYSTEM_PROMPT_HEADER = """You have access to the following tools. When you want to use a tool, you MUST respond with a JSON tool call block in this exact format (one block per tool call):
+
+<tool_call>
+{"name": "tool_name", "arguments": {"param1": "value1"}}
+</tool_call>
+
+You may include text before or after tool call blocks. You may make multiple tool calls.
+Do NOT describe what you would do - actually make the tool call using the format above.
+
+Available tools:
+"""
 
 
-def create_client_tools_mcp_server(
-    tool_definitions: List[Dict[str, Any]],
-    server_name: str = "client_tools",
-) -> Any:
-    """Create an MCP server from client-defined tool definitions.
+def create_tools_system_prompt(tool_definitions: List[Dict[str, Any]]) -> str:
+    """Generate a system prompt section describing available tools.
 
     Args:
-        tool_definitions: List of tool defs in Anthropic format, each with:
+        tool_definitions: List of tool defs, each with:
             - name: str
             - description: Optional[str]
             - input_schema: dict with type/properties/required
-        server_name: Name for the MCP server instance.
 
     Returns:
-        McpSdkServerConfig ready to pass to ClaudeAgentOptions.mcp_servers.
+        System prompt text describing the tools.
     """
-    sdk_tools = []
+    parts = [TOOL_SYSTEM_PROMPT_HEADER]
 
     for tool_def in tool_definitions:
         name = tool_def["name"]
-        description = tool_def.get("description", f"Client tool: {name}")
+        description = tool_def.get("description", "No description provided")
         input_schema = tool_def.get("input_schema", {"type": "object", "properties": {}})
 
-        # Build a proper JSON Schema dict for the SDK
-        schema = _build_schema(input_schema)
+        parts.append(f"### {name}")
+        parts.append(f"Description: {description}")
 
-        # Create the tool with a stub handler
-        sdk_tool = _create_stub_tool(name, description, schema)
-        sdk_tools.append(sdk_tool)
-        logger.debug(f"Registered client tool: {name}")
+        properties = input_schema.get("properties", {})
+        required = input_schema.get("required") or []
 
-    server = create_sdk_mcp_server(
-        name=server_name,
-        tools=sdk_tools if sdk_tools else None,
-    )
+        if properties:
+            parts.append("Parameters:")
+            for prop_name, prop_schema in properties.items():
+                prop_type = prop_schema.get("type", "any")
+                prop_desc = prop_schema.get("description", "")
+                req_marker = " (required)" if prop_name in required else ""
+                parts.append(f"  - {prop_name}: {prop_type}{req_marker} - {prop_desc}")
+        else:
+            parts.append("Parameters: none")
 
-    logger.info(f"Created MCP server '{server_name}' with {len(sdk_tools)} client tools")
-    return server
+        parts.append("")
 
-
-def _build_schema(input_schema: Dict[str, Any]) -> Dict[str, Any]:
-    """Build a JSON Schema dict from an Anthropic input_schema."""
-    schema = {
-        "type": input_schema.get("type", "object"),
-        "properties": input_schema.get("properties", {}),
-    }
-    if "required" in input_schema:
-        schema["required"] = input_schema["required"]
-    return schema
+    return "\n".join(parts)
 
 
-def _create_stub_tool(name: str, description: str, schema: Dict[str, Any]) -> Any:
-    """Create a stub SDK tool that returns a sentinel value.
+# ============================================================================
+# Tool call parsing from Claude's text response
+# ============================================================================
 
-    The stub handler is never actually called in practice because we use
-    max_turns=1, causing the SDK to stop after generating the ToolUseBlock.
+# Pattern to match <tool_call>...</tool_call> blocks
+TOOL_CALL_PATTERN = re.compile(
+    r"<tool_call>\s*(\{.*?\})\s*</tool_call>",
+    re.DOTALL,
+)
+
+
+def parse_tool_calls_from_text(
+    text: str,
+) -> tuple[List[Dict[str, Any]], str]:
+    """Parse tool call blocks from Claude's text response.
+
+    Extracts <tool_call>{"name": ..., "arguments": ...}</tool_call> patterns
+    from the text.
+
+    Args:
+        text: The raw text response from Claude.
+
+    Returns:
+        Tuple of (tool_calls, remaining_text):
+        - tool_calls: List of dicts with id, name, input keys
+        - remaining_text: Text with tool_call blocks removed
     """
+    tool_calls = []
+    remaining_text = text
 
-    @tool(name, description, schema)
-    async def stub_handler(args: Dict[str, Any]) -> Dict[str, Any]:
-        return {
-            "content": [
-                {
-                    "type": "text",
-                    "text": PENDING_CLIENT_EXECUTION,
-                }
-            ]
-        }
+    for match in TOOL_CALL_PATTERN.finditer(text):
+        json_str = match.group(1)
+        try:
+            parsed = json.loads(json_str)
+            name = parsed.get("name", "")
+            arguments = parsed.get("arguments", parsed.get("input", {}))
 
-    return stub_handler
+            tool_call = {
+                "id": f"toolu_{uuid.uuid4().hex[:24]}",
+                "name": name,
+                "input": arguments if isinstance(arguments, dict) else {},
+            }
+            tool_calls.append(tool_call)
+            logger.debug(f"Parsed tool call: {name}")
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse tool call JSON: {e}")
+
+    # Remove tool_call blocks from text
+    if tool_calls:
+        remaining_text = TOOL_CALL_PATTERN.sub("", text).strip()
+        # Clean up extra whitespace
+        remaining_text = re.sub(r"\n\s*\n\s*\n", "\n\n", remaining_text).strip()
+
+    return tool_calls, remaining_text
+
+
+# ============================================================================
+# Format converters
+# ============================================================================
 
 
 def anthropic_tool_defs_to_bridge_format(
     tool_defs: List[Any],
 ) -> List[Dict[str, Any]]:
-    """Convert AnthropicToolDefinition Pydantic models to plain dicts for the bridge.
+    """Convert AnthropicToolDefinition Pydantic models to plain dicts.
 
     Args:
         tool_defs: List of AnthropicToolDefinition models.
@@ -102,6 +152,13 @@ def anthropic_tool_defs_to_bridge_format(
     """
     result = []
     for td in tool_defs:
+        # Skip built-in tools (web_search, text_editor, etc.) - they have no input_schema
+        if hasattr(td, "is_custom_tool") and not td.is_custom_tool:
+            logger.debug(f"Skipping built-in tool: {td.name}")
+            continue
+        if not hasattr(td, "input_schema") or td.input_schema is None:
+            logger.debug(f"Skipping tool without input_schema: {td.name}")
+            continue
         entry = {
             "name": td.name,
             "description": td.description or f"Client tool: {td.name}",

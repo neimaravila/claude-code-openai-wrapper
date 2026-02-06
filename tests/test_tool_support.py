@@ -11,7 +11,7 @@ Tests cover:
 - MessageAdapter.messages_to_prompt() with role="tool" messages
 - AnthropicMessage content validation accepting tool_use/tool_result blocks
 - AnthropicMessagesRequest.get_tool_result_context()
-- tool_bridge.create_client_tools_mcp_server()
+- tool_bridge.create_tools_system_prompt() and parse_tool_calls_from_text()
 - Endpoint response formatting with tool_calls (OpenAI) and tool_use blocks (Anthropic)
 """
 
@@ -125,6 +125,26 @@ class TestAnthropicToolDefinition:
         assert tool_def.name == "noop"
         assert tool_def.description is None
         assert tool_def.input_schema.properties == {}
+        assert tool_def.is_custom_tool is True
+
+    def test_builtin_tool_web_search(self):
+        """Built-in tools like web_search have no input_schema."""
+        tool_def = AnthropicToolDefinition(
+            type="web_search_20250305",
+            name="web_search",
+            max_uses=8,
+        )
+        assert tool_def.name == "web_search"
+        assert tool_def.type == "web_search_20250305"
+        assert tool_def.input_schema is None
+        assert tool_def.is_custom_tool is False
+
+    def test_builtin_tool_text_editor(self):
+        tool_def = AnthropicToolDefinition(
+            type="text_editor_20250124",
+            name="str_replace_editor",
+        )
+        assert tool_def.is_custom_tool is False
 
 
 class TestOpenAIToolModels:
@@ -808,8 +828,66 @@ class TestToolBridge:
         assert result[0]["description"] == "Get weather"
         assert "properties" in result[0]["input_schema"]
 
-    def test_create_client_tools_mcp_server(self):
-        from src.tool_bridge import create_client_tools_mcp_server
+    def test_anthropic_tool_defs_skips_builtin_tools(self):
+        """Built-in tools without input_schema are skipped."""
+        from src.tool_bridge import anthropic_tool_defs_to_bridge_format
+
+        tool_defs = [
+            AnthropicToolDefinition(
+                type="web_search_20250305",
+                name="web_search",
+                max_uses=8,
+            ),
+            AnthropicToolDefinition(
+                name="custom_tool",
+                description="A custom tool",
+                input_schema=AnthropicToolInputSchema(
+                    properties={"q": {"type": "string"}},
+                ),
+            ),
+        ]
+        result = anthropic_tool_defs_to_bridge_format(tool_defs)
+
+        assert len(result) == 1
+        assert result[0]["name"] == "custom_tool"
+
+    def test_anthropic_tool_defs_all_builtin(self):
+        """When all tools are built-in, result is empty."""
+        from src.tool_bridge import anthropic_tool_defs_to_bridge_format
+
+        tool_defs = [
+            AnthropicToolDefinition(
+                type="web_search_20250305",
+                name="web_search",
+            ),
+        ]
+        result = anthropic_tool_defs_to_bridge_format(tool_defs)
+        assert len(result) == 0
+
+    def test_create_tools_system_prompt(self):
+        from src.tool_bridge import create_tools_system_prompt
+
+        tool_defs = [
+            {
+                "name": "get_weather",
+                "description": "Get weather for a city",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string", "description": "City name"}},
+                    "required": ["city"],
+                },
+            }
+        ]
+        prompt = create_tools_system_prompt(tool_defs)
+        assert "get_weather" in prompt
+        assert "Get weather for a city" in prompt
+        assert "city" in prompt
+        assert "(required)" in prompt
+        assert "<tool_call>" in prompt
+
+    def test_create_tools_system_prompt_required_none(self):
+        """Regression: model_dump() produces required=None, must not crash."""
+        from src.tool_bridge import create_tools_system_prompt
 
         tool_defs = [
             {
@@ -818,15 +896,33 @@ class TestToolBridge:
                 "input_schema": {
                     "type": "object",
                     "properties": {"x": {"type": "integer"}},
+                    "required": None,
                 },
             }
         ]
-        server = create_client_tools_mcp_server(tool_defs)
-        # Should return a valid server config (not None)
-        assert server is not None
+        prompt = create_tools_system_prompt(tool_defs)
+        assert "test_tool" in prompt
+        assert "(required)" not in prompt
 
-    def test_create_mcp_server_multiple_tools(self):
-        from src.tool_bridge import create_client_tools_mcp_server
+    def test_create_tools_system_prompt_from_model_dump(self):
+        """End-to-end: AnthropicToolInputSchema.model_dump() -> create_tools_system_prompt."""
+        from src.tool_bridge import anthropic_tool_defs_to_bridge_format, create_tools_system_prompt
+
+        tool_defs = [
+            AnthropicToolDefinition(
+                name="noop",
+                input_schema=AnthropicToolInputSchema(
+                    properties={"arg": {"type": "string"}},
+                ),
+            )
+        ]
+        bridge_defs = anthropic_tool_defs_to_bridge_format(tool_defs)
+        # This should not crash even though required is None in model_dump()
+        prompt = create_tools_system_prompt(bridge_defs)
+        assert "noop" in prompt
+
+    def test_create_tools_system_prompt_multiple_tools(self):
+        from src.tool_bridge import create_tools_system_prompt
 
         tool_defs = [
             {
@@ -837,32 +933,81 @@ class TestToolBridge:
             {
                 "name": "tool_b",
                 "description": "Tool B",
-                "input_schema": {"type": "object", "properties": {}},
+                "input_schema": {"type": "object", "properties": {"x": {"type": "int"}}},
             },
         ]
-        server = create_client_tools_mcp_server(tool_defs)
-        assert server is not None
+        prompt = create_tools_system_prompt(tool_defs)
+        assert "tool_a" in prompt
+        assert "tool_b" in prompt
+        assert "Tool A" in prompt
+        assert "Tool B" in prompt
 
-    def test_build_schema(self):
-        from src.tool_bridge import _build_schema
+    def test_create_tools_system_prompt_no_properties(self):
+        from src.tool_bridge import create_tools_system_prompt
 
-        schema = _build_schema(
+        tool_defs = [
             {
-                "type": "object",
-                "properties": {"city": {"type": "string"}},
-                "required": ["city"],
+                "name": "noop",
+                "description": "Does nothing",
+                "input_schema": {"type": "object", "properties": {}},
             }
+        ]
+        prompt = create_tools_system_prompt(tool_defs)
+        assert "noop" in prompt
+        assert "Parameters: none" in prompt
+
+    def test_parse_tool_calls_from_text_single(self):
+        from src.tool_bridge import parse_tool_calls_from_text
+
+        text = 'I\'ll check the weather.\n<tool_call>\n{"name": "get_weather", "arguments": {"city": "Tokyo"}}\n</tool_call>'
+        calls, remaining = parse_tool_calls_from_text(text)
+
+        assert len(calls) == 1
+        assert calls[0]["name"] == "get_weather"
+        assert calls[0]["input"] == {"city": "Tokyo"}
+        assert calls[0]["id"].startswith("toolu_")
+        assert "<tool_call>" not in remaining
+        assert "check the weather" in remaining
+
+    def test_parse_tool_calls_from_text_multiple(self):
+        from src.tool_bridge import parse_tool_calls_from_text
+
+        text = (
+            '<tool_call>\n{"name": "tool_a", "arguments": {"x": 1}}\n</tool_call>\n'
+            "Some text\n"
+            '<tool_call>\n{"name": "tool_b", "arguments": {"y": 2}}\n</tool_call>'
         )
-        assert schema["type"] == "object"
-        assert "city" in schema["properties"]
-        assert schema["required"] == ["city"]
+        calls, remaining = parse_tool_calls_from_text(text)
 
-    def test_build_schema_minimal(self):
-        from src.tool_bridge import _build_schema
+        assert len(calls) == 2
+        assert calls[0]["name"] == "tool_a"
+        assert calls[1]["name"] == "tool_b"
 
-        schema = _build_schema({})
-        assert schema["type"] == "object"
-        assert schema["properties"] == {}
+    def test_parse_tool_calls_from_text_none(self):
+        from src.tool_bridge import parse_tool_calls_from_text
+
+        text = "Just regular text, no tool calls."
+        calls, remaining = parse_tool_calls_from_text(text)
+
+        assert len(calls) == 0
+        assert remaining == text
+
+    def test_parse_tool_calls_from_text_invalid_json(self):
+        from src.tool_bridge import parse_tool_calls_from_text
+
+        text = "<tool_call>\n{invalid json}\n</tool_call>"
+        calls, remaining = parse_tool_calls_from_text(text)
+
+        assert len(calls) == 0
+
+    def test_parse_tool_calls_input_key(self):
+        from src.tool_bridge import parse_tool_calls_from_text
+
+        text = '<tool_call>\n{"name": "test", "input": {"key": "val"}}\n</tool_call>'
+        calls, remaining = parse_tool_calls_from_text(text)
+
+        assert len(calls) == 1
+        assert calls[0]["input"] == {"key": "val"}
 
 
 # ===========================================================================
