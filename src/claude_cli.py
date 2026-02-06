@@ -13,11 +13,20 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class ThinkingPart:
+    """A single thinking block with its signature."""
+
+    thinking: str
+    signature: Optional[str] = None
+
+
+@dataclass
 class ParsedMessage:
     """Parsed result from Claude Agent SDK messages."""
 
     text: Optional[str] = None
     reasoning: Optional[str] = None
+    thinking_blocks: Optional[List[ThinkingPart]] = None
 
 
 class ClaudeCodeCLI:
@@ -217,7 +226,7 @@ class ClaudeCodeCLI:
         """
         result_text = None
         last_text = None
-        reasoning_parts = []
+        thinking_parts = []
 
         for message in messages:
             # Check for ResultMessage with 'result' field (multi-turn completion)
@@ -229,13 +238,21 @@ class ClaudeCodeCLI:
                 text_parts = []
                 for block in message["content"]:
                     # Handle ThinkingBlock objects (extended thinking)
-                    if hasattr(block, "thinking"):
-                        reasoning_parts.append(block.thinking)
+                    if hasattr(block, "thinking") and not hasattr(block, "text"):
+                        signature = getattr(block, "signature", None)
+                        thinking_parts.append(
+                            ThinkingPart(thinking=block.thinking, signature=signature)
+                        )
                     # Handle TextBlock objects
                     elif hasattr(block, "text"):
                         text_parts.append(block.text)
                     elif isinstance(block, dict) and block.get("type") == "thinking":
-                        reasoning_parts.append(block.get("thinking", ""))
+                        thinking_parts.append(
+                            ThinkingPart(
+                                thinking=block.get("thinking", ""),
+                                signature=block.get("signature"),
+                            )
+                        )
                     elif isinstance(block, dict) and block.get("type") == "text":
                         text_parts.append(block.get("text", ""))
                     elif isinstance(block, str):
@@ -256,7 +273,12 @@ class ClaudeCodeCLI:
                             if isinstance(block, dict) and block.get("type") == "text":
                                 text_parts.append(block.get("text", ""))
                             elif isinstance(block, dict) and block.get("type") == "thinking":
-                                reasoning_parts.append(block.get("thinking", ""))
+                                thinking_parts.append(
+                                    ThinkingPart(
+                                        thinking=block.get("thinking", ""),
+                                        signature=block.get("signature"),
+                                    )
+                                )
                         if text_parts:
                             last_text = "\n".join(text_parts)
                     elif isinstance(content, str):
@@ -264,8 +286,12 @@ class ClaudeCodeCLI:
 
         # ResultMessage.result takes priority for text, fall back to last AssistantMessage
         final_text = result_text if result_text is not None else last_text
-        reasoning = "\n".join(reasoning_parts) if reasoning_parts else None
-        return ParsedMessage(text=final_text, reasoning=reasoning)
+        reasoning = "\n".join(tp.thinking for tp in thinking_parts) if thinking_parts else None
+        return ParsedMessage(
+            text=final_text,
+            reasoning=reasoning,
+            thinking_blocks=thinking_parts if thinking_parts else None,
+        )
 
     def extract_metadata(self, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Extract metadata like costs, tokens, and session info from SDK messages."""

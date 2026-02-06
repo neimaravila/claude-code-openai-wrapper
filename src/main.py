@@ -887,8 +887,11 @@ async def anthropic_messages(
 
         # Build content blocks (thinking + text, matching Anthropic API format)
         content_blocks: list = []
-        if parsed.reasoning:
-            content_blocks.append(AnthropicThinkingBlock(thinking=parsed.reasoning))
+        if parsed.thinking_blocks:
+            for tb in parsed.thinking_blocks:
+                content_blocks.append(
+                    AnthropicThinkingBlock(thinking=tb.thinking, signature=tb.signature)
+                )
         content_blocks.append(AnthropicTextBlock(text=assistant_content))
 
         # Create Anthropic-format response

@@ -1,8 +1,6 @@
 from typing import List, Optional, Dict, Any, Union, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 from datetime import datetime
-import base64
-import os
 import uuid
 import logging
 
@@ -434,9 +432,9 @@ class AnthropicThinkingBlock(BaseModel):
 
     type: Literal["thinking"] = "thinking"
     thinking: str
-    signature: str = Field(
-        default_factory=lambda: base64.b64encode(os.urandom(64)).decode(),
-        description="Signature for the thinking block (required by Anthropic API format)",
+    signature: Optional[str] = Field(
+        default=None,
+        description="Signature from the SDK's ThinkingBlock (passed through from Claude)",
     )
 
 
