@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import asyncio
 import logging
@@ -218,7 +219,11 @@ app = FastAPI(
 )
 
 # Configure CORS
-cors_origins = json.loads(os.getenv("CORS_ORIGINS", '["*"]'))
+try:
+    cors_origins = json.loads(os.getenv("CORS_ORIGINS", '["*"]'))
+except (json.JSONDecodeError, ValueError):
+    logger.warning("Invalid CORS_ORIGINS env var, defaulting to ['*']")
+    cors_origins = ["*"]
 cors_allow_credentials = "*" not in cors_origins
 app.add_middleware(
     CORSMiddleware,
@@ -243,8 +248,14 @@ from starlette.middleware.base import BaseHTTPMiddleware
 class RequestIDMiddleware(BaseHTTPMiddleware):
     """Add unique request ID to each request for audit trails."""
 
+    _REQUEST_ID_PATTERN = re.compile(r"^[a-zA-Z0-9\-_]{1,128}$")
+
     async def dispatch(self, request: Request, call_next):
-        request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+        client_id = request.headers.get("X-Request-ID", "")
+        if client_id and self._REQUEST_ID_PATTERN.match(client_id):
+            request_id = client_id
+        else:
+            request_id = str(uuid.uuid4())
         request.state.request_id = request_id
 
         response = await call_next(request)

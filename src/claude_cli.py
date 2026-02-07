@@ -460,10 +460,18 @@ class ClaudeCodeCLI:
         }
 
     def _cleanup_temp_dir(self):
-        """Clean up temporary directory on exit."""
+        """Clean up temporary directory on exit (symlink-safe)."""
         if self.temp_dir and os.path.exists(self.temp_dir):
             try:
-                shutil.rmtree(self.temp_dir)
+                # Verify the path is still a real directory (not a symlink)
+                real_path = os.path.realpath(self.temp_dir)
+                real_tmp_root = os.path.realpath(tempfile.gettempdir())
+                if not real_path.startswith(real_tmp_root):
+                    logger.warning(
+                        f"Temp dir {self.temp_dir} resolves outside temp root, skipping cleanup"
+                    )
+                    return
+                shutil.rmtree(real_path)
                 logger.info(f"Cleaned up temporary workspace: {self.temp_dir}")
             except Exception as e:
                 logger.warning(f"Failed to clean up temp directory {self.temp_dir}: {e}")

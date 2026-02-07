@@ -8,7 +8,17 @@ from fastapi.responses import JSONResponse
 
 
 def get_rate_limit_key(request: Request) -> str:
-    """Get the rate limiting key (IP address) from the request."""
+    """Get the rate limiting key (client IP) from the request.
+
+    Supports X-Forwarded-For and X-Real-IP headers for reverse proxy setups.
+    """
+    forwarded_for = request.headers.get("X-Forwarded-For")
+    if forwarded_for:
+        # Take the first (leftmost) IP, which is the original client
+        return forwarded_for.split(",")[0].strip()
+    real_ip = request.headers.get("X-Real-IP")
+    if real_ip:
+        return real_ip.strip()
     return get_remote_address(request)
 
 

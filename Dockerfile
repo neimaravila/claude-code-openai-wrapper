@@ -28,5 +28,5 @@ RUN poetry install --no-root
 # Expose the port (default 8000)
 EXPOSE 8000
 
-# Run the app with Uvicorn (development mode with reload; switch to --no-reload for prod)
-CMD ["poetry", "run", "uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+# Run the app with Uvicorn
+CMD ["poetry", "run", "uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]

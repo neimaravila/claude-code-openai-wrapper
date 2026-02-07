@@ -115,7 +115,7 @@ class MessageAdapter:
                     content = re.sub(pattern, "", content, flags=re.DOTALL)
 
         # Pattern to match image references or base64 data
-        image_pattern = r"\[Image:.*?\]|data:image/.*?;base64,.*?(?=\s|$)"
+        image_pattern = r"\[Image:[^\]]*\]|data:image/[^;]+;base64,[^\s]*"
 
         def replace_image(match):
             return "[Image: Content not supported by Claude Code]"

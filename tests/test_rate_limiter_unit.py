@@ -19,16 +19,37 @@ class TestGetRateLimitKey:
     """Test get_rate_limit_key()"""
 
     def test_returns_remote_address(self):
-        """Should return the remote address from the request."""
+        """Should return the remote address when no proxy headers are present."""
         with patch("src.rate_limiter.get_remote_address") as mock_get_addr:
             mock_get_addr.return_value = "192.168.1.100"
             mock_request = MagicMock(spec=Request)
+            mock_request.headers = {}
 
             from src.rate_limiter import get_rate_limit_key
 
             result = get_rate_limit_key(mock_request)
             assert result == "192.168.1.100"
             mock_get_addr.assert_called_once_with(mock_request)
+
+    def test_returns_x_forwarded_for_ip(self):
+        """Should use X-Forwarded-For header when present."""
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {"X-Forwarded-For": "10.0.0.1, 172.16.0.1"}
+
+        from src.rate_limiter import get_rate_limit_key
+
+        result = get_rate_limit_key(mock_request)
+        assert result == "10.0.0.1"
+
+    def test_returns_x_real_ip(self):
+        """Should use X-Real-IP header when present and no X-Forwarded-For."""
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {"X-Real-IP": "10.0.0.2"}
+
+        from src.rate_limiter import get_rate_limit_key
+
+        result = get_rate_limit_key(mock_request)
+        assert result == "10.0.0.2"
 
 
 class TestCreateRateLimiter:

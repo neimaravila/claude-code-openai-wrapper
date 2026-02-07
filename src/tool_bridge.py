@@ -83,8 +83,9 @@ def create_tools_system_prompt(tool_definitions: List[Dict[str, Any]]) -> str:
 # ============================================================================
 
 # Pattern to match <tool_call>...</tool_call> blocks
+# Anchored to </tool_call> delimiter to avoid excessive backtracking
 TOOL_CALL_PATTERN = re.compile(
-    r"<tool_call>\s*(\{.*?\})\s*</tool_call>",
+    r"<tool_call>\s*(\{.*?)</tool_call>",
     re.DOTALL,
 )
 
