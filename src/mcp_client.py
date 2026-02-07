@@ -94,11 +94,7 @@ class MCPClient:
             return self.servers.get(name)
 
     async def connect_server(self, name: str) -> bool:
-        """
-        Connect to an MCP server.
-
-        Returns True if connection successful, False otherwise.
-        """
+        """Connect to an MCP server."""
         if not MCP_AVAILABLE:
             logger.error("Cannot connect to MCP server: MCP SDK not available")
             return False
@@ -112,119 +108,114 @@ class MCPClient:
             logger.warning(f"MCP server is disabled: {name}")
             return False
 
-        # Check if already connected (inside lock to prevent TOCTOU race)
         async with self.lock:
+            # Check if already connected (inside lock to prevent TOCTOU)
             if name in self.connections:
                 logger.info(f"Already connected to MCP server: {name}")
                 return True
 
-        try:
-            # Create server parameters
-            server_params = StdioServerParameters(
-                command=config.command,
-                args=config.args,
-                env=config.env,
-            )
-
-            # Connect to server
-            read, write = await stdio_client(server_params)
-            session = ClientSession(read, write)
-
-            # Initialize session
-            await session.initialize()
-
-            # List available capabilities
-            available_tools = []
-            available_resources = []
-            available_prompts = []
-
             try:
-                # List tools
-                tools_response = await session.list_tools()
-                if tools_response and hasattr(tools_response, "tools"):
-                    available_tools = [
-                        {
-                            "name": tool.name,
-                            "description": getattr(tool, "description", ""),
-                            "input_schema": getattr(tool, "inputSchema", {}),
-                        }
-                        for tool in tools_response.tools
-                    ]
-            except Exception as e:
-                logger.warning(f"Could not list tools from {name}: {e}")
+                # Create server parameters
+                server_params = StdioServerParameters(
+                    command=config.command,
+                    args=config.args,
+                    env=config.env,
+                )
 
-            try:
-                # List resources
-                resources_response = await session.list_resources()
-                if resources_response and hasattr(resources_response, "resources"):
-                    available_resources = [
-                        {
-                            "uri": resource.uri,
-                            "name": getattr(resource, "name", ""),
-                            "description": getattr(resource, "description", ""),
-                            "mimeType": getattr(resource, "mimeType", None),
-                        }
-                        for resource in resources_response.resources
-                    ]
-            except Exception as e:
-                logger.warning(f"Could not list resources from {name}: {e}")
+                # Connect to server
+                read, write = await stdio_client(server_params)
+                session = ClientSession(read, write)
 
-            try:
-                # List prompts
-                prompts_response = await session.list_prompts()
-                if prompts_response and hasattr(prompts_response, "prompts"):
-                    available_prompts = [
-                        {
-                            "name": prompt.name,
-                            "description": getattr(prompt, "description", ""),
-                            "arguments": getattr(prompt, "arguments", []),
-                        }
-                        for prompt in prompts_response.prompts
-                    ]
-            except Exception as e:
-                logger.warning(f"Could not list prompts from {name}: {e}")
+                # Initialize session
+                await session.initialize()
 
-            # Store connection
-            connection = MCPServerConnection(
-                config=config,
-                session=session,
-                read_stream=read,
-                write_stream=write,
-                available_tools=available_tools,
-                available_resources=available_resources,
-                available_prompts=available_prompts,
-            )
+                # List available capabilities
+                available_tools = []
+                available_resources = []
+                available_prompts = []
 
-            async with self.lock:
+                try:
+                    tools_response = await session.list_tools()
+                    if tools_response and hasattr(tools_response, "tools"):
+                        available_tools = [
+                            {
+                                "name": tool.name,
+                                "description": getattr(tool, "description", ""),
+                                "input_schema": getattr(tool, "inputSchema", {}),
+                            }
+                            for tool in tools_response.tools
+                        ]
+                except Exception as e:
+                    logger.warning(f"Could not list tools from {name}: {e}")
+
+                try:
+                    resources_response = await session.list_resources()
+                    if resources_response and hasattr(resources_response, "resources"):
+                        available_resources = [
+                            {
+                                "uri": resource.uri,
+                                "name": getattr(resource, "name", ""),
+                                "description": getattr(resource, "description", ""),
+                                "mimeType": getattr(resource, "mimeType", None),
+                            }
+                            for resource in resources_response.resources
+                        ]
+                except Exception as e:
+                    logger.warning(f"Could not list resources from {name}: {e}")
+
+                try:
+                    prompts_response = await session.list_prompts()
+                    if prompts_response and hasattr(prompts_response, "prompts"):
+                        available_prompts = [
+                            {
+                                "name": prompt.name,
+                                "description": getattr(prompt, "description", ""),
+                                "arguments": getattr(prompt, "arguments", []),
+                            }
+                            for prompt in prompts_response.prompts
+                        ]
+                except Exception as e:
+                    logger.warning(f"Could not list prompts from {name}: {e}")
+
+                connection = MCPServerConnection(
+                    config=config,
+                    session=session,
+                    read_stream=read,
+                    write_stream=write,
+                    available_tools=available_tools,
+                    available_resources=available_resources,
+                    available_prompts=available_prompts,
+                )
+
                 self.connections[name] = connection
 
-            logger.info(
-                f"Connected to MCP server '{name}': "
-                f"{len(available_tools)} tools, "
-                f"{len(available_resources)} resources, "
-                f"{len(available_prompts)} prompts"
-            )
+                logger.info(
+                    f"Connected to MCP server '{name}': "
+                    f"{len(available_tools)} tools, "
+                    f"{len(available_resources)} resources, "
+                    f"{len(available_prompts)} prompts"
+                )
 
-            return True
+                return True
 
-        except ConnectionError as e:
-            logger.error(f"Connection failed for MCP server '{name}': {e}")
-            return False
-        except ValueError as e:
-            logger.error(f"Invalid configuration for MCP server '{name}': {e}")
-            return False
-        except TimeoutError as e:
-            logger.error(f"Connection timeout for MCP server '{name}': {e}")
-            return False
-        except FileNotFoundError as e:
-            logger.error(f"Command not found for MCP server '{name}': {e}")
-            return False
-        except PermissionError as e:
-            logger.error(f"Permission denied for MCP server '{name}': {e}")
-            return False
-        except Exception as e:
-            logger.exception(f"Unexpected error connecting to MCP server '{name}': {e}")
-            return False
+            except ConnectionError as e:
+                logger.error(f"Connection failed for MCP server '{name}': {e}")
+                return False
+            except ValueError as e:
+                logger.error(f"Invalid configuration for MCP server '{name}': {e}")
+                return False
+            except TimeoutError as e:
+                logger.error(f"Connection timeout for MCP server '{name}': {e}")
+                return False
+            except FileNotFoundError as e:
+                logger.error(f"Command not found for MCP server '{name}': {e}")
+                return False
+            except PermissionError as e:
+                logger.error(f"Permission denied for MCP server '{name}': {e}")
+                return False
+            except Exception as e:
+                logger.exception(f"Unexpected error connecting to MCP server '{name}': {e}")
+                return False
 
     async def disconnect_server(self, name: str) -> bool:
         """Disconnect from an MCP server."""

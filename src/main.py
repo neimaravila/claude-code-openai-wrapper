@@ -219,10 +219,11 @@ app = FastAPI(
 
 # Configure CORS
 cors_origins = json.loads(os.getenv("CORS_ORIGINS", '["*"]'))
+cors_allow_credentials = "*" not in cors_origins
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
-    allow_credentials=True,
+    allow_credentials=cors_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -255,24 +256,73 @@ class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
     """Limit request body size to prevent DoS attacks."""
 
     async def dispatch(self, request: Request, call_next):
+        # Check Content-Length header first (fast path)
         content_length = request.headers.get("content-length")
-        if content_length and int(content_length) > MAX_REQUEST_SIZE:
-            return JSONResponse(
-                status_code=413,
-                content={
-                    "error": {
-                        "message": f"Request body too large. Maximum size is {MAX_REQUEST_SIZE} bytes.",
-                        "type": "request_too_large",
-                        "code": 413,
-                    }
-                },
-            )
+        if content_length:
+            try:
+                if int(content_length) > MAX_REQUEST_SIZE:
+                    return JSONResponse(
+                        status_code=413,
+                        content={
+                            "error": {
+                                "message": f"Request body too large. Maximum size is {MAX_REQUEST_SIZE} bytes.",
+                                "type": "request_too_large",
+                                "code": 413,
+                            }
+                        },
+                    )
+            except ValueError:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": {
+                            "message": "Invalid Content-Length header",
+                            "type": "invalid_request",
+                            "code": 400,
+                        }
+                    },
+                )
+
+        # For requests without Content-Length (e.g., chunked encoding),
+        # read and verify actual body size
+        if request.method in ("POST", "PUT", "PATCH"):
+            body = await request.body()
+            if len(body) > MAX_REQUEST_SIZE:
+                return JSONResponse(
+                    status_code=413,
+                    content={
+                        "error": {
+                            "message": f"Request body too large. Maximum size is {MAX_REQUEST_SIZE} bytes.",
+                            "type": "request_too_large",
+                            "code": 413,
+                        }
+                    },
+                )
+
         return await call_next(request)
 
 
 # Add security middleware (order matters - first added = last executed)
 app.add_middleware(RequestIDMiddleware)
 app.add_middleware(RequestSizeLimitMiddleware)
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Add security headers to all responses."""
+
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["X-XSS-Protection"] = "1; mode=block"
+        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        if request.url.scheme == "https":
+            response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        return response
+
+
+app.add_middleware(SecurityHeadersMiddleware)
 
 
 class DebugLoggingMiddleware(BaseHTTPMiddleware):
@@ -363,7 +413,6 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
                 "field": location,
                 "message": error.get("msg", "Unknown validation error"),
                 "type": error.get("type", "validation_error"),
-                "input": error.get("input"),
             }
         )
 
@@ -488,226 +537,238 @@ async def generate_anthropic_streaming_response(
         output_text = ""
         has_tool_use = False
 
-        async for chunk in claude_cli.run_completion(
-            prompt=prompt,
-            system_prompt=system_prompt,
-            model=request_body.model,
-            max_turns=max_turns,
-            allowed_tools=allowed_tools,
-            permission_mode="bypassPermissions",
-            max_thinking_tokens=max_thinking_tokens,
-            stream=True,
-        ):
-            # Extract content from chunk (same logic as OpenAI streaming)
-            content = None
-            if chunk.get("type") == "assistant" and "message" in chunk:
-                message = chunk["message"]
-                if isinstance(message, dict) and "content" in message:
-                    content = message["content"]
-            elif "content" in chunk and isinstance(chunk["content"], list):
-                content = chunk["content"]
+        async with asyncio.timeout(claude_cli.timeout):
+            async for chunk in claude_cli.run_completion(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                model=request_body.model,
+                max_turns=max_turns,
+                allowed_tools=allowed_tools,
+                permission_mode="acceptEdits",
+                max_thinking_tokens=max_thinking_tokens,
+                stream=True,
+            ):
+                # Extract content from chunk (same logic as OpenAI streaming)
+                content = None
+                if chunk.get("type") == "assistant" and "message" in chunk:
+                    message = chunk["message"]
+                    if isinstance(message, dict) and "content" in message:
+                        content = message["content"]
+                elif "content" in chunk and isinstance(chunk["content"], list):
+                    content = chunk["content"]
 
-            if content is None:
-                continue
+                if content is None:
+                    continue
 
-            if not isinstance(content, list):
-                continue
+                if not isinstance(content, list):
+                    continue
 
-            for block in content:
-                # ThinkingBlock (has .thinking attribute)
-                if hasattr(block, "thinking") and not hasattr(block, "text"):
-                    yield anthropic_sse(
-                        "content_block_start",
-                        {
-                            "type": "content_block_start",
-                            "index": block_index,
-                            "content_block": {"type": "thinking", "thinking": ""},
-                        },
-                    )
-                    yield anthropic_sse(
-                        "content_block_delta",
-                        {
-                            "type": "content_block_delta",
-                            "index": block_index,
-                            "delta": {"type": "thinking_delta", "thinking": block.thinking},
-                        },
-                    )
-                    if hasattr(block, "signature") and block.signature:
+                for block in content:
+                    # ThinkingBlock (has .thinking attribute)
+                    if hasattr(block, "thinking") and not hasattr(block, "text"):
+                        yield anthropic_sse(
+                            "content_block_start",
+                            {
+                                "type": "content_block_start",
+                                "index": block_index,
+                                "content_block": {"type": "thinking", "thinking": ""},
+                            },
+                        )
                         yield anthropic_sse(
                             "content_block_delta",
                             {
                                 "type": "content_block_delta",
                                 "index": block_index,
                                 "delta": {
-                                    "type": "signature_delta",
-                                    "signature": block.signature,
+                                    "type": "thinking_delta",
+                                    "thinking": block.thinking,
                                 },
                             },
                         )
-                    yield anthropic_sse(
-                        "content_block_stop",
-                        {"type": "content_block_stop", "index": block_index},
-                    )
-                    block_index += 1
-                    continue
+                        if hasattr(block, "signature") and block.signature:
+                            yield anthropic_sse(
+                                "content_block_delta",
+                                {
+                                    "type": "content_block_delta",
+                                    "index": block_index,
+                                    "delta": {
+                                        "type": "signature_delta",
+                                        "signature": block.signature,
+                                    },
+                                },
+                            )
+                        yield anthropic_sse(
+                            "content_block_stop",
+                            {"type": "content_block_stop", "index": block_index},
+                        )
+                        block_index += 1
+                        continue
 
-                # ToolUseBlock (has .name + .input + .id, no .text/.thinking)
-                if (
-                    hasattr(block, "name")
-                    and hasattr(block, "input")
-                    and hasattr(block, "id")
-                    and not hasattr(block, "text")
-                    and not hasattr(block, "thinking")
-                ):
-                    has_tool_use = True
-                    block_input = block.input if isinstance(block.input, dict) else {}
-                    # content_block_start with tool_use
-                    yield anthropic_sse(
-                        "content_block_start",
-                        {
-                            "type": "content_block_start",
-                            "index": block_index,
-                            "content_block": {
-                                "type": "tool_use",
-                                "id": block.id,
-                                "name": block.name,
-                                "input": {},
+                    # ToolUseBlock (has .name + .input + .id, no .text/.thinking)
+                    if (
+                        hasattr(block, "name")
+                        and hasattr(block, "input")
+                        and hasattr(block, "id")
+                        and not hasattr(block, "text")
+                        and not hasattr(block, "thinking")
+                    ):
+                        has_tool_use = True
+                        block_input = block.input if isinstance(block.input, dict) else {}
+                        # content_block_start with tool_use
+                        yield anthropic_sse(
+                            "content_block_start",
+                            {
+                                "type": "content_block_start",
+                                "index": block_index,
+                                "content_block": {
+                                    "type": "tool_use",
+                                    "id": block.id,
+                                    "name": block.name,
+                                    "input": {},
+                                },
                             },
-                        },
-                    )
-                    # input_json_delta
-                    yield anthropic_sse(
-                        "content_block_delta",
-                        {
-                            "type": "content_block_delta",
-                            "index": block_index,
-                            "delta": {
-                                "type": "input_json_delta",
-                                "partial_json": json.dumps(block_input),
-                            },
-                        },
-                    )
-                    yield anthropic_sse(
-                        "content_block_stop",
-                        {"type": "content_block_stop", "index": block_index},
-                    )
-                    block_index += 1
-                    continue
-
-                # Dict-style thinking block
-                if isinstance(block, dict) and block.get("type") == "thinking":
-                    yield anthropic_sse(
-                        "content_block_start",
-                        {
-                            "type": "content_block_start",
-                            "index": block_index,
-                            "content_block": {"type": "thinking", "thinking": ""},
-                        },
-                    )
-                    yield anthropic_sse(
-                        "content_block_delta",
-                        {
-                            "type": "content_block_delta",
-                            "index": block_index,
-                            "delta": {
-                                "type": "thinking_delta",
-                                "thinking": block.get("thinking", ""),
-                            },
-                        },
-                    )
-                    if block.get("signature"):
+                        )
+                        # input_json_delta
                         yield anthropic_sse(
                             "content_block_delta",
                             {
                                 "type": "content_block_delta",
                                 "index": block_index,
                                 "delta": {
-                                    "type": "signature_delta",
-                                    "signature": block["signature"],
+                                    "type": "input_json_delta",
+                                    "partial_json": json.dumps(block_input),
                                 },
                             },
                         )
-                    yield anthropic_sse(
-                        "content_block_stop",
-                        {"type": "content_block_stop", "index": block_index},
-                    )
-                    block_index += 1
-                    continue
+                        yield anthropic_sse(
+                            "content_block_stop",
+                            {"type": "content_block_stop", "index": block_index},
+                        )
+                        block_index += 1
+                        continue
 
-                # Dict-style tool_use block
-                if isinstance(block, dict) and block.get("type") == "tool_use":
-                    has_tool_use = True
+                    # Dict-style thinking block
+                    if isinstance(block, dict) and block.get("type") == "thinking":
+                        yield anthropic_sse(
+                            "content_block_start",
+                            {
+                                "type": "content_block_start",
+                                "index": block_index,
+                                "content_block": {
+                                    "type": "thinking",
+                                    "thinking": "",
+                                },
+                            },
+                        )
+                        yield anthropic_sse(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": block_index,
+                                "delta": {
+                                    "type": "thinking_delta",
+                                    "thinking": block.get("thinking", ""),
+                                },
+                            },
+                        )
+                        if block.get("signature"):
+                            yield anthropic_sse(
+                                "content_block_delta",
+                                {
+                                    "type": "content_block_delta",
+                                    "index": block_index,
+                                    "delta": {
+                                        "type": "signature_delta",
+                                        "signature": block["signature"],
+                                    },
+                                },
+                            )
+                        yield anthropic_sse(
+                            "content_block_stop",
+                            {"type": "content_block_stop", "index": block_index},
+                        )
+                        block_index += 1
+                        continue
+
+                    # Dict-style tool_use block
+                    if isinstance(block, dict) and block.get("type") == "tool_use":
+                        has_tool_use = True
+                        yield anthropic_sse(
+                            "content_block_start",
+                            {
+                                "type": "content_block_start",
+                                "index": block_index,
+                                "content_block": {
+                                    "type": "tool_use",
+                                    "id": block.get("id", ""),
+                                    "name": block.get("name", ""),
+                                    "input": {},
+                                },
+                            },
+                        )
+                        yield anthropic_sse(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": block_index,
+                                "delta": {
+                                    "type": "input_json_delta",
+                                    "partial_json": json.dumps(block.get("input", {})),
+                                },
+                            },
+                        )
+                        yield anthropic_sse(
+                            "content_block_stop",
+                            {"type": "content_block_stop", "index": block_index},
+                        )
+                        block_index += 1
+                        continue
+
+                    # TextBlock (has .text attribute or dict with type=text)
+                    if hasattr(block, "text"):
+                        raw_text = block.text
+                    elif isinstance(block, dict) and block.get("type") == "text":
+                        raw_text = block.get("text", "")
+                    else:
+                        continue
+
+                    filtered_text = MessageAdapter.filter_content(
+                        raw_text,
+                        preserve_thinking=True,
+                        preserve_tools=preserve_tools,
+                    )
+                    if not filtered_text or filtered_text.isspace():
+                        continue
+
+                    output_text += filtered_text
+
+                    # content_block_start
                     yield anthropic_sse(
                         "content_block_start",
                         {
                             "type": "content_block_start",
                             "index": block_index,
-                            "content_block": {
-                                "type": "tool_use",
-                                "id": block.get("id", ""),
-                                "name": block.get("name", ""),
-                                "input": {},
-                            },
+                            "content_block": {"type": "text", "text": ""},
                         },
                     )
+                    # text_delta
                     yield anthropic_sse(
                         "content_block_delta",
                         {
                             "type": "content_block_delta",
                             "index": block_index,
                             "delta": {
-                                "type": "input_json_delta",
-                                "partial_json": json.dumps(block.get("input", {})),
+                                "type": "text_delta",
+                                "text": filtered_text,
                             },
                         },
                     )
+                    # content_block_stop
                     yield anthropic_sse(
                         "content_block_stop",
                         {"type": "content_block_stop", "index": block_index},
                     )
                     block_index += 1
-                    continue
-
-                # TextBlock (has .text attribute or dict with type=text)
-                if hasattr(block, "text"):
-                    raw_text = block.text
-                elif isinstance(block, dict) and block.get("type") == "text":
-                    raw_text = block.get("text", "")
-                else:
-                    continue
-
-                filtered_text = MessageAdapter.filter_content(
-                    raw_text, preserve_thinking=True, preserve_tools=preserve_tools
-                )
-                if not filtered_text or filtered_text.isspace():
-                    continue
-
-                output_text += filtered_text
-
-                # content_block_start
-                yield anthropic_sse(
-                    "content_block_start",
-                    {
-                        "type": "content_block_start",
-                        "index": block_index,
-                        "content_block": {"type": "text", "text": ""},
-                    },
-                )
-                # text_delta
-                yield anthropic_sse(
-                    "content_block_delta",
-                    {
-                        "type": "content_block_delta",
-                        "index": block_index,
-                        "delta": {"type": "text_delta", "text": filtered_text},
-                    },
-                )
-                # content_block_stop
-                yield anthropic_sse(
-                    "content_block_stop",
-                    {"type": "content_block_stop", "index": block_index},
-                )
-                block_index += 1
 
         # Parse tool calls from text (for client-defined tools via system prompt)
         if has_client_tools and output_text and not has_tool_use:
@@ -768,7 +829,10 @@ async def generate_anthropic_streaming_response(
         logger.error(f"Anthropic streaming error: {e}")
         yield anthropic_sse(
             "error",
-            {"type": "error", "error": {"type": "api_error", "message": str(e)}},
+            {
+                "type": "error",
+                "error": {"type": "api_error", "message": "Internal server error"},
+            },
         )
 
 
@@ -862,202 +926,205 @@ async def generate_streaming_response(
         tool_call_index = 0
         output_text = ""  # Track full text for post-loop tool call parsing
 
-        async for chunk in claude_cli.run_completion(
-            prompt=prompt,
-            system_prompt=system_prompt,
-            model=claude_options.get("model"),
-            max_turns=claude_options.get("max_turns", 10),
-            allowed_tools=claude_options.get("allowed_tools"),
-            disallowed_tools=claude_options.get("disallowed_tools"),
-            permission_mode=claude_options.get("permission_mode"),
-            max_thinking_tokens=claude_options.get("max_thinking_tokens"),
-            stream=True,
-        ):
-            chunks_buffer.append(chunk)
+        async with asyncio.timeout(claude_cli.timeout):
+            async for chunk in claude_cli.run_completion(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                model=claude_options.get("model"),
+                max_turns=claude_options.get("max_turns", 10),
+                allowed_tools=claude_options.get("allowed_tools"),
+                disallowed_tools=claude_options.get("disallowed_tools"),
+                permission_mode=claude_options.get("permission_mode"),
+                max_thinking_tokens=claude_options.get("max_thinking_tokens"),
+                stream=True,
+            ):
+                chunks_buffer.append(chunk)
 
-            # Check if we have an assistant message
-            content = None
-            if chunk.get("type") == "assistant" and "message" in chunk:
-                message = chunk["message"]
-                if isinstance(message, dict) and "content" in message:
-                    content = message["content"]
-            elif "content" in chunk and isinstance(chunk["content"], list):
-                content = chunk["content"]
+                # Check if we have an assistant message
+                content = None
+                if chunk.get("type") == "assistant" and "message" in chunk:
+                    message = chunk["message"]
+                    if isinstance(message, dict) and "content" in message:
+                        content = message["content"]
+                elif "content" in chunk and isinstance(chunk["content"], list):
+                    content = chunk["content"]
 
-            if content is not None:
-                # Send initial role chunk if we haven't already
-                if not role_sent:
-                    initial_chunk = ChatCompletionStreamResponse(
-                        id=request_id,
-                        model=request.model,
-                        choices=[
-                            StreamChoice(
-                                index=0,
-                                delta={"role": "assistant", "content": ""},
-                                finish_reason=None,
-                            )
-                        ],
-                    )
-                    yield f"data: {initial_chunk.model_dump_json()}\n\n"
-                    role_sent = True
-
-                # Handle content blocks
-                if isinstance(content, list):
-                    for block in content:
-                        # Handle ThinkingBlock objects (extended thinking / reasoning)
-                        if hasattr(block, "thinking") and not hasattr(block, "text"):
-                            stream_chunk = ChatCompletionStreamResponse(
-                                id=request_id,
-                                model=request.model,
-                                choices=[
-                                    StreamChoice(
-                                        index=0,
-                                        delta={"reasoning_content": block.thinking},
-                                        finish_reason=None,
-                                    )
-                                ],
-                            )
-                            yield f"data: {stream_chunk.model_dump_json()}\n\n"
-                            continue
-
-                        # Handle dict-style thinking blocks
-                        if isinstance(block, dict) and block.get("type") == "thinking":
-                            stream_chunk = ChatCompletionStreamResponse(
-                                id=request_id,
-                                model=request.model,
-                                choices=[
-                                    StreamChoice(
-                                        index=0,
-                                        delta={"reasoning_content": block.get("thinking", "")},
-                                        finish_reason=None,
-                                    )
-                                ],
-                            )
-                            yield f"data: {stream_chunk.model_dump_json()}\n\n"
-                            continue
-
-                        # Handle ToolUseBlock objects (has .name + .input + .id)
-                        if (
-                            hasattr(block, "name")
-                            and hasattr(block, "input")
-                            and hasattr(block, "id")
-                            and not hasattr(block, "text")
-                            and not hasattr(block, "thinking")
-                        ):
-                            has_tool_use = True
-                            block_input = block.input if isinstance(block.input, dict) else {}
-                            stream_chunk = ChatCompletionStreamResponse(
-                                id=request_id,
-                                model=request.model,
-                                choices=[
-                                    StreamChoice(
-                                        index=0,
-                                        delta={
-                                            "tool_calls": [
-                                                {
-                                                    "index": tool_call_index,
-                                                    "id": block.id,
-                                                    "type": "function",
-                                                    "function": {
-                                                        "name": block.name,
-                                                        "arguments": json.dumps(block_input),
-                                                    },
-                                                }
-                                            ]
-                                        },
-                                        finish_reason=None,
-                                    )
-                                ],
-                            )
-                            yield f"data: {stream_chunk.model_dump_json()}\n\n"
-                            tool_call_index += 1
-                            content_sent = True
-                            continue
-
-                        # Handle dict-style tool_use blocks
-                        if isinstance(block, dict) and block.get("type") == "tool_use":
-                            has_tool_use = True
-                            stream_chunk = ChatCompletionStreamResponse(
-                                id=request_id,
-                                model=request.model,
-                                choices=[
-                                    StreamChoice(
-                                        index=0,
-                                        delta={
-                                            "tool_calls": [
-                                                {
-                                                    "index": tool_call_index,
-                                                    "id": block.get("id", ""),
-                                                    "type": "function",
-                                                    "function": {
-                                                        "name": block.get("name", ""),
-                                                        "arguments": json.dumps(
-                                                            block.get("input", {})
-                                                        ),
-                                                    },
-                                                }
-                                            ]
-                                        },
-                                        finish_reason=None,
-                                    )
-                                ],
-                            )
-                            yield f"data: {stream_chunk.model_dump_json()}\n\n"
-                            tool_call_index += 1
-                            content_sent = True
-                            continue
-
-                        # Handle TextBlock objects from Claude Agent SDK
-                        if hasattr(block, "text"):
-                            raw_text = block.text
-                        elif isinstance(block, dict) and block.get("type") == "text":
-                            raw_text = block.get("text", "")
-                        else:
-                            continue
-
-                        # Filter out tool usage
-                        filtered_text = MessageAdapter.filter_content(
-                            raw_text,
-                            preserve_thinking=True,
-                            preserve_tools=preserve_tools,
-                        )
-
-                        if filtered_text and not filtered_text.isspace():
-                            output_text += filtered_text
-                            stream_chunk = ChatCompletionStreamResponse(
-                                id=request_id,
-                                model=request.model,
-                                choices=[
-                                    StreamChoice(
-                                        index=0,
-                                        delta={"content": filtered_text},
-                                        finish_reason=None,
-                                    )
-                                ],
-                            )
-                            yield f"data: {stream_chunk.model_dump_json()}\n\n"
-                            content_sent = True
-
-                elif isinstance(content, str):
-                    filtered_content = MessageAdapter.filter_content(
-                        content, preserve_thinking=True, preserve_tools=preserve_tools
-                    )
-
-                    if filtered_content and not filtered_content.isspace():
-                        output_text += filtered_content
-                        stream_chunk = ChatCompletionStreamResponse(
+                if content is not None:
+                    # Send initial role chunk if we haven't already
+                    if not role_sent:
+                        initial_chunk = ChatCompletionStreamResponse(
                             id=request_id,
                             model=request.model,
                             choices=[
                                 StreamChoice(
                                     index=0,
-                                    delta={"content": filtered_content},
+                                    delta={"role": "assistant", "content": ""},
                                     finish_reason=None,
                                 )
                             ],
                         )
-                        yield f"data: {stream_chunk.model_dump_json()}\n\n"
-                        content_sent = True
+                        yield f"data: {initial_chunk.model_dump_json()}\n\n"
+                        role_sent = True
+
+                    # Handle content blocks
+                    if isinstance(content, list):
+                        for block in content:
+                            # Handle ThinkingBlock objects (extended thinking / reasoning)
+                            if hasattr(block, "thinking") and not hasattr(block, "text"):
+                                stream_chunk = ChatCompletionStreamResponse(
+                                    id=request_id,
+                                    model=request.model,
+                                    choices=[
+                                        StreamChoice(
+                                            index=0,
+                                            delta={"reasoning_content": block.thinking},
+                                            finish_reason=None,
+                                        )
+                                    ],
+                                )
+                                yield f"data: {stream_chunk.model_dump_json()}\n\n"
+                                continue
+
+                            # Handle dict-style thinking blocks
+                            if isinstance(block, dict) and block.get("type") == "thinking":
+                                stream_chunk = ChatCompletionStreamResponse(
+                                    id=request_id,
+                                    model=request.model,
+                                    choices=[
+                                        StreamChoice(
+                                            index=0,
+                                            delta={"reasoning_content": block.get("thinking", "")},
+                                            finish_reason=None,
+                                        )
+                                    ],
+                                )
+                                yield f"data: {stream_chunk.model_dump_json()}\n\n"
+                                continue
+
+                            # Handle ToolUseBlock objects (has .name + .input + .id)
+                            if (
+                                hasattr(block, "name")
+                                and hasattr(block, "input")
+                                and hasattr(block, "id")
+                                and not hasattr(block, "text")
+                                and not hasattr(block, "thinking")
+                            ):
+                                has_tool_use = True
+                                block_input = block.input if isinstance(block.input, dict) else {}
+                                stream_chunk = ChatCompletionStreamResponse(
+                                    id=request_id,
+                                    model=request.model,
+                                    choices=[
+                                        StreamChoice(
+                                            index=0,
+                                            delta={
+                                                "tool_calls": [
+                                                    {
+                                                        "index": tool_call_index,
+                                                        "id": block.id,
+                                                        "type": "function",
+                                                        "function": {
+                                                            "name": block.name,
+                                                            "arguments": json.dumps(block_input),
+                                                        },
+                                                    }
+                                                ]
+                                            },
+                                            finish_reason=None,
+                                        )
+                                    ],
+                                )
+                                yield f"data: {stream_chunk.model_dump_json()}\n\n"
+                                tool_call_index += 1
+                                content_sent = True
+                                continue
+
+                            # Handle dict-style tool_use blocks
+                            if isinstance(block, dict) and block.get("type") == "tool_use":
+                                has_tool_use = True
+                                stream_chunk = ChatCompletionStreamResponse(
+                                    id=request_id,
+                                    model=request.model,
+                                    choices=[
+                                        StreamChoice(
+                                            index=0,
+                                            delta={
+                                                "tool_calls": [
+                                                    {
+                                                        "index": tool_call_index,
+                                                        "id": block.get("id", ""),
+                                                        "type": "function",
+                                                        "function": {
+                                                            "name": block.get("name", ""),
+                                                            "arguments": json.dumps(
+                                                                block.get("input", {})
+                                                            ),
+                                                        },
+                                                    }
+                                                ]
+                                            },
+                                            finish_reason=None,
+                                        )
+                                    ],
+                                )
+                                yield f"data: {stream_chunk.model_dump_json()}\n\n"
+                                tool_call_index += 1
+                                content_sent = True
+                                continue
+
+                            # Handle TextBlock objects from Claude Agent SDK
+                            if hasattr(block, "text"):
+                                raw_text = block.text
+                            elif isinstance(block, dict) and block.get("type") == "text":
+                                raw_text = block.get("text", "")
+                            else:
+                                continue
+
+                            # Filter out tool usage
+                            filtered_text = MessageAdapter.filter_content(
+                                raw_text,
+                                preserve_thinking=True,
+                                preserve_tools=preserve_tools,
+                            )
+
+                            if filtered_text and not filtered_text.isspace():
+                                output_text += filtered_text
+                                stream_chunk = ChatCompletionStreamResponse(
+                                    id=request_id,
+                                    model=request.model,
+                                    choices=[
+                                        StreamChoice(
+                                            index=0,
+                                            delta={"content": filtered_text},
+                                            finish_reason=None,
+                                        )
+                                    ],
+                                )
+                                yield f"data: {stream_chunk.model_dump_json()}\n\n"
+                                content_sent = True
+
+                    elif isinstance(content, str):
+                        filtered_content = MessageAdapter.filter_content(
+                            content,
+                            preserve_thinking=True,
+                            preserve_tools=preserve_tools,
+                        )
+
+                        if filtered_content and not filtered_content.isspace():
+                            output_text += filtered_content
+                            stream_chunk = ChatCompletionStreamResponse(
+                                id=request_id,
+                                model=request.model,
+                                choices=[
+                                    StreamChoice(
+                                        index=0,
+                                        delta={"content": filtered_content},
+                                        finish_reason=None,
+                                    )
+                                ],
+                            )
+                            yield f"data: {stream_chunk.model_dump_json()}\n\n"
+                            content_sent = True
 
         # Parse tool calls from text (for client-defined tools via system prompt)
         if has_client_tools and output_text and not has_tool_use:
@@ -1173,7 +1240,7 @@ async def generate_streaming_response(
 
     except Exception as e:
         logger.error(f"Streaming error: {e}")
-        error_chunk = {"error": {"message": str(e), "type": "streaming_error"}}
+        error_chunk = {"error": {"message": "Internal server error", "type": "streaming_error"}}
         yield f"data: {json.dumps(error_chunk)}\n\n"
 
 
@@ -1412,7 +1479,7 @@ async def chat_completions(
         raise
     except Exception as e:
         logger.error(f"Chat completion error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.post("/v1/messages")
@@ -1517,7 +1584,7 @@ async def anthropic_messages(
             model=request_body.model,
             max_turns=max_turns,
             allowed_tools=allowed_tools,
-            permission_mode="bypassPermissions",
+            permission_mode="acceptEdits",
             max_thinking_tokens=max_thinking_tokens,
             stream=False,
         ):
@@ -1597,7 +1664,7 @@ async def anthropic_messages(
         raise
     except Exception as e:
         logger.error(f"Anthropic Messages API error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.get("/v1/models")
@@ -2375,14 +2442,12 @@ async def get_auth_status(
     active_api_key = auth_manager.get_api_key()
 
     return {
-        "claude_code_auth": auth_info,
+        "claude_code_auth": {
+            "method": auth_info.get("method", "unknown"),
+            "status": {"valid": auth_info.get("status", {}).get("valid", False)},
+        },
         "server_info": {
             "api_key_required": bool(active_api_key),
-            "api_key_source": (
-                "environment"
-                if os.getenv("API_KEY")
-                else ("runtime" if runtime_api_key else "none")
-            ),
             "version": "1.0.0",
         },
     }
