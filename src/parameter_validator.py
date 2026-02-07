@@ -114,21 +114,11 @@ class ParameterValidator:
                     f"Invalid X-Claude-Max-Turns header: {headers['x-claude-max-turns']}"
                 )
 
-        # Extract allowed tools
-        if "x-claude-allowed-tools" in headers:
-            tools = [tool.strip() for tool in headers["x-claude-allowed-tools"].split(",")]
-            if tools:
-                claude_options["allowed_tools"] = tools
+        # NOTE: allowed_tools and disallowed_tools are NOT configurable via headers
+        # (security-sensitive). They must be set server-side or via the /v1/tools/config endpoint.
 
-        # Extract disallowed tools
-        if "x-claude-disallowed-tools" in headers:
-            tools = [tool.strip() for tool in headers["x-claude-disallowed-tools"].split(",")]
-            if tools:
-                claude_options["disallowed_tools"] = tools
-
-        # Extract permission mode
-        if "x-claude-permission-mode" in headers:
-            claude_options["permission_mode"] = headers["x-claude-permission-mode"]
+        # NOTE: permission_mode is NOT configurable via headers (security-sensitive).
+        # It must be set server-side only.
 
         # Extract max thinking tokens
         if "x-claude-max-thinking-tokens" in headers:

@@ -1,4 +1,5 @@
 import os
+import secrets
 import logging
 from typing import Optional, Dict, Any, Tuple
 from fastapi import HTTPException, Request
@@ -251,8 +252,8 @@ async def verify_api_key(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # Verify the API key
-    if credentials.credentials != active_api_key:
+    # Verify the API key (constant-time comparison to prevent timing attacks)
+    if not secrets.compare_digest(credentials.credentials, active_api_key):
         raise HTTPException(
             status_code=401,
             detail="Invalid API key",

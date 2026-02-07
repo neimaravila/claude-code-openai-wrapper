@@ -290,7 +290,10 @@ class DebugLoggingMiddleware(BaseHTTPMiddleware):
 
         # Log basic request info with request ID for correlation
         logger.debug(f"🔍 [{request_id}] Incoming request: {request.method} {request.url}")
-        logger.debug(f"🔍 [{request_id}] Headers: {dict(request.headers)}")
+        safe_headers = dict(request.headers)
+        if "authorization" in safe_headers:
+            safe_headers["authorization"] = "[REDACTED]"
+        logger.debug(f"🔍 [{request_id}] Headers: {safe_headers}")
 
         # For POST requests, try to log body (but don't break if we can't)
         body_logged = False
@@ -775,7 +778,7 @@ async def generate_streaming_response(
     """Generate SSE formatted streaming response."""
     try:
         # Process messages with session management
-        all_messages, actual_session_id = session_manager.process_messages(
+        all_messages, actual_session_id = await session_manager.process_messages(
             request.messages, request.session_id
         )
 
@@ -1141,7 +1144,7 @@ async def generate_streaming_response(
             # Store in session if applicable
             if actual_session_id and assistant_content:
                 assistant_message = Message(role="assistant", content=assistant_content)
-                session_manager.add_assistant_response(actual_session_id, assistant_message)
+                await session_manager.add_assistant_response(actual_session_id, assistant_message)
 
         # Prepare usage data if requested
         usage_data = None
@@ -1221,7 +1224,7 @@ async def chat_completions(
         else:
             # Non-streaming response
             # Process messages with session management
-            all_messages, actual_session_id = session_manager.process_messages(
+            all_messages, actual_session_id = await session_manager.process_messages(
                 request_body.messages, request_body.session_id
             )
 
@@ -1357,7 +1360,7 @@ async def chat_completions(
             # Add assistant response to session if using session mode
             if actual_session_id and assistant_content:
                 assistant_message = Message(role="assistant", content=assistant_content)
-                session_manager.add_assistant_response(actual_session_id, assistant_message)
+                await session_manager.add_assistant_response(actual_session_id, assistant_message)
 
             # Estimate tokens (rough approximation)
             prompt_tokens = MessageAdapter.estimate_tokens(prompt)
@@ -2274,8 +2277,12 @@ async def root():
 
 @app.post("/v1/debug/request")
 @rate_limit_endpoint("debug")
-async def debug_request_validation(request: Request):
+async def debug_request_validation(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
     """Debug endpoint to test request validation and see what's being sent."""
+    await verify_api_key(request, credentials)
     try:
         # Get the raw request body
         body = await request.body()
@@ -2296,7 +2303,10 @@ async def debug_request_validation(request: Request):
         if parsed_body:
             try:
                 chat_request = ChatCompletionRequest(**parsed_body)
-                validation_result = {"valid": True, "validated_data": chat_request.model_dump()}
+                validation_result = {
+                    "valid": True,
+                    "validated_data": chat_request.model_dump(),
+                }
             except ValidationError as e:
                 validation_result = {
                     "valid": False,
@@ -2311,9 +2321,14 @@ async def debug_request_validation(request: Request):
                     ],
                 }
 
+        # Redact authorization header before returning
+        safe_headers = dict(request.headers)
+        if "authorization" in safe_headers:
+            safe_headers["authorization"] = "[REDACTED]"
+
         return {
             "debug_info": {
-                "headers": dict(request.headers),
+                "headers": safe_headers,
                 "method": request.method,
                 "url": str(request.url),
                 "raw_body": raw_body,
@@ -2329,11 +2344,17 @@ async def debug_request_validation(request: Request):
             }
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
+        # Redact authorization header in error path too
+        safe_headers = dict(request.headers)
+        if "authorization" in safe_headers:
+            safe_headers["authorization"] = "[REDACTED]"
         return {
             "debug_info": {
                 "error": f"Debug endpoint error: {str(e)}",
-                "headers": dict(request.headers),
+                "headers": safe_headers,
                 "method": request.method,
                 "url": str(request.url),
             }
@@ -2342,8 +2363,12 @@ async def debug_request_validation(request: Request):
 
 @app.get("/v1/auth/status")
 @rate_limit_endpoint("auth")
-async def get_auth_status(request: Request):
+async def get_auth_status(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
     """Get Claude Code authentication status."""
+    await verify_api_key(request, credentials)
     from src.auth import auth_manager
 
     auth_info = get_claude_code_auth_info()
@@ -2365,10 +2390,12 @@ async def get_auth_status(request: Request):
 
 @app.get("/v1/sessions/stats")
 async def get_session_stats(
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
     """Get session manager statistics."""
-    stats = session_manager.get_stats()
+    await verify_api_key(request, credentials)
+    stats = await session_manager.get_stats()
     return {
         "session_stats": stats,
         "cleanup_interval_minutes": session_manager.cleanup_interval_minutes,
@@ -2377,18 +2404,25 @@ async def get_session_stats(
 
 
 @app.get("/v1/sessions")
-async def list_sessions(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)):
+async def list_sessions(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
     """List all active sessions."""
-    sessions = session_manager.list_sessions()
+    await verify_api_key(request, credentials)
+    sessions = await session_manager.list_sessions()
     return SessionListResponse(sessions=sessions, total=len(sessions))
 
 
 @app.get("/v1/sessions/{session_id}")
 async def get_session(
-    session_id: str, credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+    session_id: str,
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
     """Get information about a specific session."""
-    session = session_manager.get_session(session_id)
+    await verify_api_key(request, credentials)
+    session = await session_manager.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
@@ -2397,10 +2431,13 @@ async def get_session(
 
 @app.delete("/v1/sessions/{session_id}")
 async def delete_session(
-    session_id: str, credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+    session_id: str,
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
     """Delete a specific session."""
-    deleted = session_manager.delete_session(session_id)
+    await verify_api_key(request, credentials)
+    deleted = await session_manager.delete_session(session_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Session not found")
 
@@ -2445,8 +2482,8 @@ async def get_tool_config(
     """Get tool configuration (global or per-session)."""
     await verify_api_key(request, credentials)
 
-    config = tool_manager.get_effective_config(session_id)
-    effective_tools = tool_manager.get_effective_tools(session_id)
+    config = await tool_manager.get_effective_config(session_id)
+    effective_tools = await tool_manager.get_effective_tools(session_id)
 
     return ToolConfigurationResponse(
         allowed_tools=config.allowed_tools,
@@ -2485,15 +2522,21 @@ async def update_tool_config(
 
     # Update configuration
     if config_request.session_id:
-        config = tool_manager.set_session_config(
-            config_request.session_id, config_request.allowed_tools, config_request.disallowed_tools
+        config = await tool_manager.set_session_config(
+            config_request.session_id,
+            config_request.allowed_tools,
+            config_request.disallowed_tools,
         )
     else:
-        config = tool_manager.update_global_config(
-            config_request.allowed_tools, config_request.disallowed_tools
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Global tool configuration cannot be modified at runtime. "
+                "Use per-session configuration with a session_id."
+            ),
         )
 
-    effective_tools = tool_manager.get_effective_tools(config_request.session_id)
+    effective_tools = await tool_manager.get_effective_tools(config_request.session_id)
 
     return ToolConfigurationResponse(
         allowed_tools=config.allowed_tools,
@@ -2511,7 +2554,7 @@ async def get_tool_stats(
 ):
     """Get statistics about tool configuration and usage."""
     await verify_api_key(request, credentials)
-    return tool_manager.get_stats()
+    return await tool_manager.get_stats()
 
 
 # MCP (Model Context Protocol) Management Endpoints
@@ -2530,12 +2573,12 @@ async def list_mcp_servers(
             status_code=503, detail="MCP SDK not available. Install with: pip install mcp"
         )
 
-    servers = mcp_client.list_servers()
-    connections = mcp_client.list_connected_servers()
+    servers = await mcp_client.list_servers()
+    connections = await mcp_client.list_connected_servers()
 
     server_responses = []
     for server in servers:
-        connection = mcp_client.get_connection(server.name)
+        connection = await mcp_client.get_connection(server.name)
         server_responses.append(
             MCPServerInfoResponse(
                 name=server.name,
@@ -2577,7 +2620,7 @@ async def register_mcp_server(
         enabled=body.enabled,
     )
 
-    mcp_client.register_server(config)
+    await mcp_client.register_server(config)
 
     return {"message": f"MCP server '{body.name}' registered successfully"}
 
@@ -2604,7 +2647,7 @@ async def connect_mcp_server(
             status_code=500, detail=f"Failed to connect to MCP server '{body.server_name}'"
         )
 
-    connection = mcp_client.get_connection(body.server_name)
+    connection = await mcp_client.get_connection(body.server_name)
     return {
         "message": f"Connected to MCP server '{body.server_name}'",
         "tools": len(connection.available_tools) if connection else 0,
@@ -2645,7 +2688,7 @@ async def get_mcp_stats(
 ):
     """Get statistics about MCP connections."""
     await verify_api_key(request, credentials)
-    return mcp_client.get_stats()
+    return await mcp_client.get_stats()
 
 
 @app.exception_handler(HTTPException)

@@ -1,4 +1,5 @@
 import os
+import asyncio
 import tempfile
 import atexit
 import shutil
@@ -89,6 +90,9 @@ class ClaudeCodeCLI:
         # Store auth environment variables for SDK
         self.claude_env_vars = auth_manager.get_claude_code_env_vars()
 
+        # Lock to prevent concurrent os.environ mutation (race condition)
+        self._env_lock = asyncio.Lock()
+
     async def verify_cli(self) -> bool:
         """Verify Claude Agent SDK is working and authenticated."""
         try:
@@ -148,87 +152,91 @@ class ClaudeCodeCLI:
         """Run Claude Agent using the Python SDK and yield response chunks."""
 
         try:
-            # Set authentication environment variables (if any)
-            original_env = {}
-            if self.claude_env_vars:  # Only set env vars if we have any
-                for key, value in self.claude_env_vars.items():
-                    original_env[key] = os.environ.get(key)
-                    os.environ[key] = value
+            # Acquire lock to prevent concurrent os.environ mutations
+            # This prevents race conditions where concurrent requests corrupt
+            # each other's environment variables (e.g., API keys leaking between tenants)
+            async with self._env_lock:
+                # Set authentication environment variables (if any)
+                original_env = {}
+                if self.claude_env_vars:  # Only set env vars if we have any
+                    for key, value in self.claude_env_vars.items():
+                        original_env[key] = os.environ.get(key)
+                        os.environ[key] = value
 
-            try:
-                # Build SDK options
-                options = ClaudeAgentOptions(max_turns=max_turns, cwd=self.cwd)
+                try:
+                    # Build SDK options
+                    options = ClaudeAgentOptions(max_turns=max_turns, cwd=self.cwd)
 
-                # Set model if specified
-                if model:
-                    options.model = model
+                    # Set model if specified
+                    if model:
+                        options.model = model
 
-                # Set system prompt - CLAUDE AGENT SDK STRUCTURED FORMAT
-                # Use structured format as per SDK documentation
-                if system_prompt:
-                    options.system_prompt = {"type": "text", "text": system_prompt}
-                else:
-                    # Use Claude Code preset to maintain expected behavior
-                    options.system_prompt = {"type": "preset", "preset": "claude_code"}
-
-                # Set tool restrictions
-                if allowed_tools:
-                    options.allowed_tools = allowed_tools
-                if disallowed_tools:
-                    options.disallowed_tools = disallowed_tools
-
-                # Set permission mode (needed for tool execution in API context)
-                if permission_mode:
-                    options.permission_mode = permission_mode
-
-                # Set max thinking tokens for extended thinking / reasoning
-                if max_thinking_tokens is not None:
-                    options.max_thinking_tokens = max_thinking_tokens
-
-                # Set MCP servers for client-defined tools
-                if mcp_servers:
-                    options.mcp_servers = mcp_servers
-
-                # Handle session continuity
-                if continue_session:
-                    options.continue_session = True
-                elif session_id:
-                    options.resume = session_id
-
-                # Run the query and yield messages
-                async for message in query(prompt=prompt, options=options):
-                    # Debug logging
-                    logger.debug(f"Raw SDK message type: {type(message)}")
-                    logger.debug(f"Raw SDK message: {message}")
-
-                    # Convert message object to dict if needed
-                    if hasattr(message, "__dict__") and not isinstance(message, dict):
-                        # Convert object to dict for consistent handling
-                        message_dict = {}
-
-                        # Get all attributes from the object
-                        for attr_name in dir(message):
-                            if not attr_name.startswith("_"):  # Skip private attributes
-                                try:
-                                    attr_value = getattr(message, attr_name)
-                                    if not callable(attr_value):  # Skip methods
-                                        message_dict[attr_name] = attr_value
-                                except:
-                                    pass
-
-                        logger.debug(f"Converted message dict: {message_dict}")
-                        yield message_dict
+                    # Set system prompt - CLAUDE AGENT SDK STRUCTURED FORMAT
+                    # Use structured format as per SDK documentation
+                    if system_prompt:
+                        options.system_prompt = {"type": "text", "text": system_prompt}
                     else:
-                        yield message
+                        # Use Claude Code preset to maintain expected behavior
+                        options.system_prompt = {"type": "preset", "preset": "claude_code"}
 
-            finally:
-                # Restore original environment (if we changed anything)
-                if original_env:
-                    for key, original_value in original_env.items():
-                        if original_value is None:
-                            os.environ.pop(key, None)
+                    # Set tool restrictions
+                    if allowed_tools:
+                        options.allowed_tools = allowed_tools
+                    if disallowed_tools:
+                        options.disallowed_tools = disallowed_tools
+
+                    # Set permission mode (needed for tool execution in API context)
+                    if permission_mode:
+                        options.permission_mode = permission_mode
+
+                    # Set max thinking tokens for extended thinking / reasoning
+                    if max_thinking_tokens is not None:
+                        options.max_thinking_tokens = max_thinking_tokens
+
+                    # Set MCP servers for client-defined tools
+                    if mcp_servers:
+                        options.mcp_servers = mcp_servers
+
+                    # Handle session continuity
+                    if continue_session:
+                        options.continue_session = True
+                    elif session_id:
+                        options.resume = session_id
+
+                    # Run the query and yield messages
+                    async for message in query(prompt=prompt, options=options):
+                        # Debug logging
+                        logger.debug(f"Raw SDK message type: {type(message)}")
+                        logger.debug(f"Raw SDK message: {message}")
+
+                        # Convert message object to dict if needed
+                        if hasattr(message, "__dict__") and not isinstance(message, dict):
+                            # Convert object to dict for consistent handling
+                            message_dict = {}
+
+                            # Get all attributes from the object
+                            for attr_name in dir(message):
+                                if not attr_name.startswith("_"):  # Skip private attributes
+                                    try:
+                                        attr_value = getattr(message, attr_name)
+                                        if not callable(attr_value):  # Skip methods
+                                            message_dict[attr_name] = attr_value
+                                    except:
+                                        pass
+
+                            logger.debug(f"Converted message dict: {message_dict}")
+                            yield message_dict
                         else:
-                            os.environ[key] = original_value
+                            yield message
+
+                finally:
+                    # Restore original environment (if we changed anything)
+                    if original_env:
+                        for key, original_value in original_env.items():
+                            if original_value is None:
+                                os.environ.pop(key, None)
+                            else:
+                                os.environ[key] = original_value
 
         except Exception as e:
             logger.error(f"Claude Agent SDK error: {e}")

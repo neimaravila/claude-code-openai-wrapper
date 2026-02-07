@@ -197,29 +197,23 @@ class TestParameterValidatorExtractClaudeHeaders:
             assert "max_turns" not in result
             mock_logger.warning.assert_called_once()
 
-    def test_extracts_allowed_tools(self):
-        """X-Claude-Allowed-Tools header is extracted correctly."""
+    def test_allowed_tools_header_ignored_for_security(self):
+        """X-Claude-Allowed-Tools header is NOT extracted (security-sensitive)."""
         headers = {"x-claude-allowed-tools": "Read,Write,Bash"}
         result = ParameterValidator.extract_claude_headers(headers)
-        assert result.get("allowed_tools") == ["Read", "Write", "Bash"]
+        assert "allowed_tools" not in result
 
-    def test_allowed_tools_strips_whitespace(self):
-        """Tool names have whitespace stripped."""
-        headers = {"x-claude-allowed-tools": " Read , Write , Bash "}
-        result = ParameterValidator.extract_claude_headers(headers)
-        assert result.get("allowed_tools") == ["Read", "Write", "Bash"]
-
-    def test_extracts_disallowed_tools(self):
-        """X-Claude-Disallowed-Tools header is extracted correctly."""
+    def test_disallowed_tools_header_ignored_for_security(self):
+        """X-Claude-Disallowed-Tools header is NOT extracted (security-sensitive)."""
         headers = {"x-claude-disallowed-tools": "Edit,Delete"}
         result = ParameterValidator.extract_claude_headers(headers)
-        assert result.get("disallowed_tools") == ["Edit", "Delete"]
+        assert "disallowed_tools" not in result
 
-    def test_extracts_permission_mode(self):
-        """X-Claude-Permission-Mode header is extracted correctly."""
+    def test_permission_mode_header_ignored_for_security(self):
+        """X-Claude-Permission-Mode header is NOT extracted (security-sensitive)."""
         headers = {"x-claude-permission-mode": "bypassPermissions"}
         result = ParameterValidator.extract_claude_headers(headers)
-        assert result.get("permission_mode") == "bypassPermissions"
+        assert "permission_mode" not in result
 
     def test_extracts_max_thinking_tokens(self):
         """X-Claude-Max-Thinking-Tokens header is extracted correctly."""
@@ -236,18 +230,21 @@ class TestParameterValidatorExtractClaudeHeaders:
             mock_logger.warning.assert_called_once()
 
     def test_extracts_multiple_headers(self):
-        """Multiple Claude headers are all extracted."""
+        """Multiple Claude headers are extracted; security-sensitive ones are ignored."""
         headers = {
             "x-claude-max-turns": "5",
             "x-claude-allowed-tools": "Read,Write",
             "x-claude-permission-mode": "default",
+            "x-claude-disallowed-tools": "Bash",
             "x-claude-max-thinking-tokens": "3000",
         }
         result = ParameterValidator.extract_claude_headers(headers)
         assert result.get("max_turns") == 5
-        assert result.get("allowed_tools") == ["Read", "Write"]
-        assert result.get("permission_mode") == "default"
         assert result.get("max_thinking_tokens") == 3000
+        # Security-sensitive headers must NOT be extracted
+        assert "allowed_tools" not in result
+        assert "permission_mode" not in result
+        assert "disallowed_tools" not in result
 
 
 class TestCompatibilityReporter:

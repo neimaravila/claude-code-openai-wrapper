@@ -6,10 +6,10 @@ Tests the MCPClient, MCPServerConfig, and MCPServerConnection classes.
 These are pure unit tests that don't require actual MCP servers.
 """
 
+import asyncio
 import pytest
 from datetime import datetime
 from unittest.mock import MagicMock, patch, AsyncMock
-import threading
 
 from src.mcp_client import (
     MCPServerConfig,
@@ -119,75 +119,85 @@ class TestMCPClient:
         """is_available returns MCP_AVAILABLE constant."""
         assert client.is_available() == MCP_AVAILABLE
 
-    def test_register_server(self, client):
+    @pytest.mark.asyncio
+    async def test_register_server(self, client):
         """register_server adds server configuration."""
         config = MCPServerConfig(name="test-server", command="test-cmd")
-        client.register_server(config)
+        await client.register_server(config)
 
         assert "test-server" in client.servers
         assert client.servers["test-server"] is config
 
-    def test_register_server_overwrites_existing(self, client):
+    @pytest.mark.asyncio
+    async def test_register_server_overwrites_existing(self, client):
         """register_server overwrites existing configuration."""
         config1 = MCPServerConfig(name="test-server", command="cmd1")
         config2 = MCPServerConfig(name="test-server", command="cmd2")
 
-        client.register_server(config1)
-        client.register_server(config2)
+        await client.register_server(config1)
+        await client.register_server(config2)
 
         assert client.servers["test-server"].command == "cmd2"
 
-    def test_unregister_server_existing(self, client):
+    @pytest.mark.asyncio
+    async def test_unregister_server_existing(self, client):
         """unregister_server removes existing server."""
         config = MCPServerConfig(name="test-server", command="cmd")
-        client.register_server(config)
+        await client.register_server(config)
         assert "test-server" in client.servers
 
-        result = client.unregister_server("test-server")
+        result = await client.unregister_server("test-server")
         assert result is True
         assert "test-server" not in client.servers
 
-    def test_unregister_server_nonexistent(self, client):
+    @pytest.mark.asyncio
+    async def test_unregister_server_nonexistent(self, client):
         """unregister_server returns False for nonexistent server."""
-        result = client.unregister_server("nonexistent")
+        result = await client.unregister_server("nonexistent")
         assert result is False
 
-    def test_list_servers(self, client):
+    @pytest.mark.asyncio
+    async def test_list_servers(self, client):
         """list_servers returns all registered servers."""
         config1 = MCPServerConfig(name="server1", command="cmd1")
         config2 = MCPServerConfig(name="server2", command="cmd2")
 
-        client.register_server(config1)
-        client.register_server(config2)
+        await client.register_server(config1)
+        await client.register_server(config2)
 
-        servers = client.list_servers()
+        servers = await client.list_servers()
         assert len(servers) == 2
         names = [s.name for s in servers]
         assert "server1" in names
         assert "server2" in names
 
-    def test_list_servers_empty(self, client):
+    @pytest.mark.asyncio
+    async def test_list_servers_empty(self, client):
         """list_servers returns empty list when no servers registered."""
-        assert client.list_servers() == []
+        assert await client.list_servers() == []
 
-    def test_get_server_existing(self, client):
+    @pytest.mark.asyncio
+    async def test_get_server_existing(self, client):
         """get_server returns existing server config."""
         config = MCPServerConfig(name="test-server", command="cmd")
-        client.register_server(config)
+        await client.register_server(config)
 
-        result = client.get_server("test-server")
+        result = await client.get_server("test-server")
         assert result is config
 
-    def test_get_server_nonexistent(self, client):
+    @pytest.mark.asyncio
+    async def test_get_server_nonexistent(self, client):
         """get_server returns None for nonexistent server."""
-        result = client.get_server("nonexistent")
+        result = await client.get_server("nonexistent")
         assert result is None
 
-    def test_list_connected_servers_empty(self, client):
+    @pytest.mark.asyncio
+    async def test_list_connected_servers_empty(self, client):
         """list_connected_servers returns empty list when no connections."""
-        assert client.list_connected_servers() == []
+        assert await client.list_connected_servers() == []
 
-    def test_list_connected_servers_with_connections(self, client):
+    @pytest.mark.asyncio
+    async def test_list_connected_servers_with_connections(self, client):
         """list_connected_servers returns names of connected servers."""
         config = MCPServerConfig(name="test", command="cmd")
         connection = MCPServerConnection(
@@ -198,10 +208,11 @@ class TestMCPClient:
         )
         client.connections["test"] = connection
 
-        result = client.list_connected_servers()
+        result = await client.list_connected_servers()
         assert result == ["test"]
 
-    def test_get_connection_existing(self, client):
+    @pytest.mark.asyncio
+    async def test_get_connection_existing(self, client):
         """get_connection returns existing connection."""
         config = MCPServerConfig(name="test", command="cmd")
         connection = MCPServerConnection(
@@ -212,19 +223,22 @@ class TestMCPClient:
         )
         client.connections["test"] = connection
 
-        result = client.get_connection("test")
+        result = await client.get_connection("test")
         assert result is connection
 
-    def test_get_connection_nonexistent(self, client):
+    @pytest.mark.asyncio
+    async def test_get_connection_nonexistent(self, client):
         """get_connection returns None for nonexistent connection."""
-        result = client.get_connection("nonexistent")
+        result = await client.get_connection("nonexistent")
         assert result is None
 
-    def test_get_all_tools_empty(self, client):
+    @pytest.mark.asyncio
+    async def test_get_all_tools_empty(self, client):
         """get_all_tools returns empty dict when no connections."""
-        assert client.get_all_tools() == {}
+        assert await client.get_all_tools() == {}
 
-    def test_get_all_tools_with_connections(self, client):
+    @pytest.mark.asyncio
+    async def test_get_all_tools_with_connections(self, client):
         """get_all_tools returns tools from all connections."""
         config1 = MCPServerConfig(name="server1", command="cmd")
         config2 = MCPServerConfig(name="server2", command="cmd")
@@ -247,15 +261,16 @@ class TestMCPClient:
         client.connections["server1"] = conn1
         client.connections["server2"] = conn2
 
-        result = client.get_all_tools()
+        result = await client.get_all_tools()
         assert "server1" in result
         assert "server2" in result
         assert len(result["server1"]) == 1
         assert len(result["server2"]) == 2
 
-    def test_get_stats_empty(self, client):
+    @pytest.mark.asyncio
+    async def test_get_stats_empty(self, client):
         """get_stats returns correct stats when empty."""
-        stats = client.get_stats()
+        stats = await client.get_stats()
 
         assert stats["mcp_available"] == MCP_AVAILABLE
         assert stats["registered_servers"] == 0
@@ -265,7 +280,8 @@ class TestMCPClient:
         assert stats["total_prompts"] == 0
         assert stats["servers"] == []
 
-    def test_get_stats_with_servers(self, client):
+    @pytest.mark.asyncio
+    async def test_get_stats_with_servers(self, client):
         """get_stats includes registered server info."""
         config = MCPServerConfig(
             name="test-server",
@@ -273,19 +289,20 @@ class TestMCPClient:
             description="Test server",
             enabled=True,
         )
-        client.register_server(config)
+        await client.register_server(config)
 
-        stats = client.get_stats()
+        stats = await client.get_stats()
         assert stats["registered_servers"] == 1
         assert len(stats["servers"]) == 1
         assert stats["servers"][0]["name"] == "test-server"
         assert stats["servers"][0]["enabled"] is True
         assert stats["servers"][0]["connected"] is False
 
-    def test_get_stats_with_connections(self, client):
+    @pytest.mark.asyncio
+    async def test_get_stats_with_connections(self, client):
         """get_stats counts tools, resources, prompts correctly."""
         config = MCPServerConfig(name="test", command="cmd")
-        client.register_server(config)
+        await client.register_server(config)
 
         connection = MCPServerConnection(
             config=config,
@@ -298,7 +315,7 @@ class TestMCPClient:
         )
         client.connections["test"] = connection
 
-        stats = client.get_stats()
+        stats = await client.get_stats()
         assert stats["connected_servers"] == 1
         assert stats["total_tools"] == 2
         assert stats["total_resources"] == 1
@@ -324,7 +341,7 @@ class TestMCPClientAsync:
     async def test_connect_server_disabled(self, client):
         """connect_server returns False for disabled server."""
         config = MCPServerConfig(name="disabled", command="cmd", enabled=False)
-        client.register_server(config)
+        await client.register_server(config)
 
         result = await client.connect_server("disabled")
         assert result is False
@@ -333,7 +350,7 @@ class TestMCPClientAsync:
     async def test_connect_server_already_connected(self, client):
         """connect_server returns True when already connected."""
         config = MCPServerConfig(name="test", command="cmd")
-        client.register_server(config)
+        await client.register_server(config)
 
         # Add fake connection
         connection = MCPServerConnection(
@@ -533,7 +550,7 @@ class TestMCPClientConnectServerMCPAvailable:
         with patch("src.mcp_client.MCP_AVAILABLE", False):
             client = MCPClient()
             config = MCPServerConfig(name="test", command="cmd")
-            client.register_server(config)
+            await client.register_server(config)
 
             result = await client.connect_server("test")
             assert result is False
@@ -554,7 +571,7 @@ class TestMCPClientConnectServerWithMocking:
             pytest.skip("MCP SDK not available")
 
         config = MCPServerConfig(name="test", command="test-cmd")
-        client.register_server(config)
+        await client.register_server(config)
 
         # Create mock tools, resources, prompts
         mock_tool = MagicMock()
@@ -613,7 +630,7 @@ class TestMCPClientConnectServerWithMocking:
             pytest.skip("MCP SDK not available")
 
         config = MCPServerConfig(name="test", command="test-cmd")
-        client.register_server(config)
+        await client.register_server(config)
 
         mock_session = AsyncMock()
         mock_session.initialize = AsyncMock()
@@ -640,7 +657,7 @@ class TestMCPClientConnectServerWithMocking:
             pytest.skip("MCP SDK not available")
 
         config = MCPServerConfig(name="test", command="test-cmd")
-        client.register_server(config)
+        await client.register_server(config)
 
         mock_session = AsyncMock()
         mock_session.initialize = AsyncMock()
@@ -667,7 +684,7 @@ class TestMCPClientConnectServerWithMocking:
             pytest.skip("MCP SDK not available")
 
         config = MCPServerConfig(name="test", command="test-cmd")
-        client.register_server(config)
+        await client.register_server(config)
 
         mock_session = AsyncMock()
         mock_session.initialize = AsyncMock()
@@ -694,7 +711,7 @@ class TestMCPClientConnectServerWithMocking:
             pytest.skip("MCP SDK not available")
 
         config = MCPServerConfig(name="test", command="test-cmd")
-        client.register_server(config)
+        await client.register_server(config)
 
         with patch("src.mcp_client.StdioServerParameters"):
             with patch("src.mcp_client.stdio_client", new_callable=AsyncMock) as mock_stdio:
@@ -710,7 +727,7 @@ class TestMCPClientConnectServerWithMocking:
             pytest.skip("MCP SDK not available")
 
         config = MCPServerConfig(name="test", command="test-cmd")
-        client.register_server(config)
+        await client.register_server(config)
 
         with patch("src.mcp_client.StdioServerParameters"):
             with patch("src.mcp_client.stdio_client", new_callable=AsyncMock) as mock_stdio:
@@ -726,7 +743,7 @@ class TestMCPClientConnectServerWithMocking:
             pytest.skip("MCP SDK not available")
 
         config = MCPServerConfig(name="test", command="test-cmd")
-        client.register_server(config)
+        await client.register_server(config)
 
         with patch("src.mcp_client.StdioServerParameters"):
             with patch("src.mcp_client.stdio_client", new_callable=AsyncMock) as mock_stdio:
@@ -742,7 +759,7 @@ class TestMCPClientConnectServerWithMocking:
             pytest.skip("MCP SDK not available")
 
         config = MCPServerConfig(name="test", command="nonexistent-cmd")
-        client.register_server(config)
+        await client.register_server(config)
 
         with patch("src.mcp_client.StdioServerParameters"):
             with patch("src.mcp_client.stdio_client", new_callable=AsyncMock) as mock_stdio:
@@ -758,7 +775,7 @@ class TestMCPClientConnectServerWithMocking:
             pytest.skip("MCP SDK not available")
 
         config = MCPServerConfig(name="test", command="test-cmd")
-        client.register_server(config)
+        await client.register_server(config)
 
         with patch("src.mcp_client.StdioServerParameters"):
             with patch("src.mcp_client.stdio_client", new_callable=AsyncMock) as mock_stdio:
@@ -774,7 +791,7 @@ class TestMCPClientConnectServerWithMocking:
             pytest.skip("MCP SDK not available")
 
         config = MCPServerConfig(name="test", command="test-cmd")
-        client.register_server(config)
+        await client.register_server(config)
 
         with patch("src.mcp_client.StdioServerParameters"):
             with patch("src.mcp_client.stdio_client", new_callable=AsyncMock) as mock_stdio:
@@ -805,65 +822,55 @@ class TestMCPClientConnectServerWithMocking:
         assert "test" not in client.connections
 
 
-class TestMCPClientThreadSafety:
-    """Test thread safety of MCPClient operations."""
+class TestMCPClientConcurrency:
+    """Test concurrency of MCPClient operations with asyncio."""
 
     @pytest.fixture
     def client(self):
         """Create a fresh MCPClient for each test."""
         return MCPClient()
 
-    def test_concurrent_server_registration(self, client):
-        """Multiple threads can register servers concurrently."""
+    @pytest.mark.asyncio
+    async def test_concurrent_server_registration(self, client):
+        """Multiple coroutines can register servers concurrently."""
         results = []
         errors = []
 
-        def register_server(name):
+        async def register_server(name):
             try:
                 config = MCPServerConfig(name=name, command="cmd")
-                client.register_server(config)
+                await client.register_server(config)
                 results.append(name)
             except Exception as e:
                 errors.append(str(e))
 
-        threads = []
-        for i in range(20):
-            t = threading.Thread(target=register_server, args=(f"server-{i}",))
-            threads.append(t)
-            t.start()
-
-        for t in threads:
-            t.join()
+        tasks = [register_server(f"server-{i}") for i in range(20)]
+        await asyncio.gather(*tasks)
 
         assert len(errors) == 0
         assert len(results) == 20
         assert len(client.servers) == 20
 
-    def test_concurrent_get_stats(self, client):
-        """Multiple threads can call get_stats concurrently."""
+    @pytest.mark.asyncio
+    async def test_concurrent_get_stats(self, client):
+        """Multiple coroutines can call get_stats concurrently."""
         # Register some servers first
         for i in range(10):
             config = MCPServerConfig(name=f"server-{i}", command="cmd")
-            client.register_server(config)
+            await client.register_server(config)
 
         results = []
         errors = []
 
-        def get_stats():
+        async def get_stats():
             try:
-                stats = client.get_stats()
+                stats = await client.get_stats()
                 results.append(stats)
             except Exception as e:
                 errors.append(str(e))
 
-        threads = []
-        for _ in range(20):
-            t = threading.Thread(target=get_stats)
-            threads.append(t)
-            t.start()
-
-        for t in threads:
-            t.join()
+        tasks = [get_stats() for _ in range(20)]
+        await asyncio.gather(*tasks)
 
         assert len(errors) == 0
         assert len(results) == 20

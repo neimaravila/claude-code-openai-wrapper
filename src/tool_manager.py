@@ -4,11 +4,11 @@ Tool configuration and metadata management for Claude Code OpenAI Wrapper.
 Provides tool metadata, per-session configuration, and management endpoints.
 """
 
+import asyncio
 import logging
 from typing import Dict, List, Optional, Set
 from dataclasses import dataclass, field
-from threading import Lock
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from src.constants import CLAUDE_TOOLS, DEFAULT_ALLOWED_TOOLS, DEFAULT_DISALLOWED_TOOLS
 
@@ -283,6 +283,12 @@ class ToolConfiguration:
         self.updated_at = datetime.utcnow()
 
 
+# Maximum number of per-session tool configs to prevent memory exhaustion
+MAX_TOOL_SESSION_CONFIGS = 1000
+# TTL for per-session tool configs
+TOOL_SESSION_CONFIG_TTL_HOURS = 1
+
+
 class ToolManager:
     """Manages tool configurations globally and per-session."""
 
@@ -292,7 +298,7 @@ class ToolManager:
             disallowed_tools=list(DEFAULT_DISALLOWED_TOOLS),
         )
         self.session_configs: Dict[str, ToolConfiguration] = {}
-        self.lock = Lock()
+        self.lock = asyncio.Lock()
 
     def get_tool_metadata(self, tool_name: str) -> Optional[ToolMetadata]:
         """Get metadata for a specific tool."""
@@ -302,37 +308,65 @@ class ToolManager:
         """List all available tools with metadata."""
         return list(TOOL_METADATA.values())
 
-    def get_global_config(self) -> ToolConfiguration:
+    async def get_global_config(self) -> ToolConfiguration:
         """Get the global tool configuration."""
-        with self.lock:
+        async with self.lock:
             return self.global_config
 
-    def update_global_config(
+    async def update_global_config(
         self,
         allowed_tools: Optional[List[str]] = None,
         disallowed_tools: Optional[List[str]] = None,
     ) -> ToolConfiguration:
-        """Update the global tool configuration."""
-        with self.lock:
+        """Update the global tool configuration (per-session only, no global override)."""
+        async with self.lock:
             self.global_config.update(allowed_tools, disallowed_tools)
             logger.info(
                 f"Updated global tool config: allowed={allowed_tools}, disallowed={disallowed_tools}"
             )
             return self.global_config
 
-    def get_session_config(self, session_id: str) -> Optional[ToolConfiguration]:
+    async def get_session_config(self, session_id: str) -> Optional[ToolConfiguration]:
         """Get tool configuration for a specific session."""
-        with self.lock:
-            return self.session_configs.get(session_id)
+        async with self.lock:
+            config = self.session_configs.get(session_id)
+            if config:
+                # Check TTL
+                if datetime.utcnow() - config.created_at > timedelta(
+                    hours=TOOL_SESSION_CONFIG_TTL_HOURS
+                ):
+                    del self.session_configs[session_id]
+                    return None
+            return config
 
-    def set_session_config(
+    async def set_session_config(
         self,
         session_id: str,
         allowed_tools: Optional[List[str]] = None,
         disallowed_tools: Optional[List[str]] = None,
     ) -> ToolConfiguration:
         """Set tool configuration for a specific session."""
-        with self.lock:
+        async with self.lock:
+            # Evict expired configs
+            expired = [
+                sid
+                for sid, cfg in self.session_configs.items()
+                if datetime.utcnow() - cfg.created_at
+                > timedelta(hours=TOOL_SESSION_CONFIG_TTL_HOURS)
+            ]
+            for sid in expired:
+                del self.session_configs[sid]
+
+            # Enforce limit
+            if (
+                session_id not in self.session_configs
+                and len(self.session_configs) >= MAX_TOOL_SESSION_CONFIGS
+            ):
+                # Evict oldest
+                oldest = min(self.session_configs, key=lambda k: self.session_configs[k].created_at)
+                del self.session_configs[oldest]
+                logger.warning(f"Tool session config limit reached, evicted: {oldest}")
+
             if session_id not in self.session_configs:
                 self.session_configs[session_id] = ToolConfiguration()
 
@@ -340,30 +374,30 @@ class ToolManager:
             logger.info(f"Updated session {session_id} tool config")
             return self.session_configs[session_id]
 
-    def delete_session_config(self, session_id: str) -> bool:
+    async def delete_session_config(self, session_id: str) -> bool:
         """Delete tool configuration for a session."""
-        with self.lock:
+        async with self.lock:
             if session_id in self.session_configs:
                 del self.session_configs[session_id]
                 logger.info(f"Deleted tool config for session {session_id}")
                 return True
             return False
 
-    def get_effective_config(self, session_id: Optional[str] = None) -> ToolConfiguration:
+    async def get_effective_config(self, session_id: Optional[str] = None) -> ToolConfiguration:
         """
         Get effective tool configuration.
 
         If session_id is provided and has a config, use that.
         Otherwise, use global config.
         """
-        with self.lock:
+        async with self.lock:
             if session_id and session_id in self.session_configs:
                 return self.session_configs[session_id]
             return self.global_config
 
-    def get_effective_tools(self, session_id: Optional[str] = None) -> List[str]:
+    async def get_effective_tools(self, session_id: Optional[str] = None) -> List[str]:
         """Get the list of effective tools for a session or globally."""
-        config = self.get_effective_config(session_id)
+        config = await self.get_effective_config(session_id)
         return sorted(list(config.get_effective_tools()))
 
     def validate_tools(self, tool_names: List[str]) -> Dict[str, bool]:
@@ -374,9 +408,9 @@ class ToolManager:
         """
         return {name: name in CLAUDE_TOOLS for name in tool_names}
 
-    def get_stats(self) -> Dict:
+    async def get_stats(self) -> Dict:
         """Get statistics about tool usage and configuration."""
-        with self.lock:
+        async with self.lock:
             return {
                 "total_tools": len(CLAUDE_TOOLS),
                 "global_allowed": (

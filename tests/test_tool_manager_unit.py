@@ -6,10 +6,10 @@ Tests the ToolMetadata, ToolConfiguration, and ToolManager classes.
 These are pure unit tests that don't require a running server.
 """
 
+import asyncio
 import pytest
 from datetime import datetime, timedelta
 from unittest.mock import patch, MagicMock
-import threading
 import time
 
 from src.tool_manager import (
@@ -209,86 +209,98 @@ class TestToolManager:
         assert len(tools) == len(TOOL_METADATA)
         assert all(isinstance(t, ToolMetadata) for t in tools)
 
-    def test_get_global_config(self, manager):
+    @pytest.mark.asyncio
+    async def test_get_global_config(self, manager):
         """get_global_config returns the global configuration."""
-        config = manager.get_global_config()
+        config = await manager.get_global_config()
         assert config is manager.global_config
 
-    def test_update_global_config(self, manager):
+    @pytest.mark.asyncio
+    async def test_update_global_config(self, manager):
         """update_global_config updates the global configuration."""
-        result = manager.update_global_config(
+        result = await manager.update_global_config(
             allowed_tools=["Bash", "Read"],
             disallowed_tools=["Task"],
         )
         assert result.allowed_tools == ["Bash", "Read"]
         assert result.disallowed_tools == ["Task"]
 
-    def test_get_session_config_nonexistent(self, manager):
+    @pytest.mark.asyncio
+    async def test_get_session_config_nonexistent(self, manager):
         """get_session_config returns None for nonexistent session."""
-        config = manager.get_session_config("nonexistent-session")
+        config = await manager.get_session_config("nonexistent-session")
         assert config is None
 
-    def test_set_session_config_creates_new(self, manager):
+    @pytest.mark.asyncio
+    async def test_set_session_config_creates_new(self, manager):
         """set_session_config creates new config for session."""
-        result = manager.set_session_config(
+        result = await manager.set_session_config(
             session_id="session-123",
             allowed_tools=["Bash"],
         )
         assert result.allowed_tools == ["Bash"]
         assert "session-123" in manager.session_configs
 
-    def test_set_session_config_updates_existing(self, manager):
+    @pytest.mark.asyncio
+    async def test_set_session_config_updates_existing(self, manager):
         """set_session_config updates existing session config."""
-        manager.set_session_config("session-123", allowed_tools=["Bash"])
-        manager.set_session_config("session-123", disallowed_tools=["Task"])
+        await manager.set_session_config("session-123", allowed_tools=["Bash"])
+        await manager.set_session_config("session-123", disallowed_tools=["Task"])
 
-        config = manager.get_session_config("session-123")
+        config = await manager.get_session_config("session-123")
         assert config.allowed_tools == ["Bash"]
         assert config.disallowed_tools == ["Task"]
 
-    def test_delete_session_config_existing(self, manager):
+    @pytest.mark.asyncio
+    async def test_delete_session_config_existing(self, manager):
         """delete_session_config removes existing session config."""
-        manager.set_session_config("session-123", allowed_tools=["Bash"])
+        await manager.set_session_config("session-123", allowed_tools=["Bash"])
         assert "session-123" in manager.session_configs
 
-        result = manager.delete_session_config("session-123")
+        result = await manager.delete_session_config("session-123")
         assert result is True
         assert "session-123" not in manager.session_configs
 
-    def test_delete_session_config_nonexistent(self, manager):
+    @pytest.mark.asyncio
+    async def test_delete_session_config_nonexistent(self, manager):
         """delete_session_config returns False for nonexistent session."""
-        result = manager.delete_session_config("nonexistent")
+        result = await manager.delete_session_config("nonexistent")
         assert result is False
 
-    def test_get_effective_config_no_session(self, manager):
+    @pytest.mark.asyncio
+    async def test_get_effective_config_no_session(self, manager):
         """get_effective_config returns global config when no session."""
-        config = manager.get_effective_config()
+        config = await manager.get_effective_config()
         assert config is manager.global_config
 
-    def test_get_effective_config_with_session(self, manager):
+    @pytest.mark.asyncio
+    async def test_get_effective_config_with_session(self, manager):
         """get_effective_config returns session config when exists."""
-        manager.set_session_config("session-123", allowed_tools=["Bash"])
-        config = manager.get_effective_config("session-123")
+        await manager.set_session_config("session-123", allowed_tools=["Bash"])
+        config = await manager.get_effective_config("session-123")
 
         assert config is not manager.global_config
         assert config.allowed_tools == ["Bash"]
 
-    def test_get_effective_config_missing_session_uses_global(self, manager):
+    @pytest.mark.asyncio
+    async def test_get_effective_config_missing_session_uses_global(self, manager):
         """get_effective_config uses global when session doesn't exist."""
-        config = manager.get_effective_config("nonexistent")
+        config = await manager.get_effective_config("nonexistent")
         assert config is manager.global_config
 
-    def test_get_effective_tools_global(self, manager):
+    @pytest.mark.asyncio
+    async def test_get_effective_tools_global(self, manager):
         """get_effective_tools returns sorted list from global config."""
-        manager.update_global_config(allowed_tools=["Write", "Bash", "Read"])
-        tools = manager.get_effective_tools()
+        await manager.update_global_config(allowed_tools=["Write", "Bash", "Read"])
+        tools = await manager.get_effective_tools()
 
         assert tools == ["Bash", "Read", "Write"]  # Sorted
 
-    def test_get_effective_tools_session(self, manager):
+    @pytest.mark.asyncio
+    async def test_get_effective_tools_session(self, manager):
         """get_effective_tools returns tools from session config."""
-        manager.set_session_config("session-123", allowed_tools=["Grep", "Glob"])
-        tools = manager.get_effective_tools("session-123")
+        await manager.set_session_config("session-123", allowed_tools=["Grep", "Glob"])
+        tools = await manager.get_effective_tools("session-123")
 
         assert tools == ["Glob", "Grep"]  # Sorted
 
@@ -307,13 +319,14 @@ class TestToolManager:
         result = manager.validate_tools([])
         assert result == {}
 
-    def test_get_stats(self, manager):
+    @pytest.mark.asyncio
+    async def test_get_stats(self, manager):
         """get_stats returns statistics about tools."""
         # Add some session configs
-        manager.set_session_config("session-1", allowed_tools=["Bash"])
-        manager.set_session_config("session-2", allowed_tools=["Read"])
+        await manager.set_session_config("session-1", allowed_tools=["Bash"])
+        await manager.set_session_config("session-2", allowed_tools=["Read"])
 
-        stats = manager.get_stats()
+        stats = await manager.get_stats()
 
         assert stats["total_tools"] == len(CLAUDE_TOOLS)
         assert stats["session_configs"] == 2
@@ -321,73 +334,52 @@ class TestToolManager:
         assert "file" in stats["tool_categories"]
         assert "system" in stats["tool_categories"]
 
-    def test_global_allowed_count_in_stats(self, manager):
+    @pytest.mark.asyncio
+    async def test_global_allowed_count_in_stats(self, manager):
         """get_stats shows correct global allowed count."""
-        manager.update_global_config(allowed_tools=["Bash", "Read", "Write"])
-        stats = manager.get_stats()
+        await manager.update_global_config(allowed_tools=["Bash", "Read", "Write"])
+        stats = await manager.get_stats()
         assert stats["global_allowed"] == 3
 
-    def test_global_disallowed_count_in_stats(self, manager):
+    @pytest.mark.asyncio
+    async def test_global_disallowed_count_in_stats(self, manager):
         """get_stats shows correct global disallowed count."""
-        manager.update_global_config(disallowed_tools=["Task", "WebSearch"])
-        stats = manager.get_stats()
+        await manager.update_global_config(disallowed_tools=["Task", "WebSearch"])
+        stats = await manager.get_stats()
         assert stats["global_disallowed"] == 2
 
 
-class TestToolManagerThreadSafety:
-    """Test thread safety of ToolManager operations."""
+class TestToolManagerAsyncSafety:
+    """Test async safety of ToolManager operations."""
 
     @pytest.fixture
     def manager(self):
         """Create a fresh ToolManager for each test."""
         return ToolManager()
 
-    def test_concurrent_session_creation(self, manager):
-        """Multiple threads can create session configs concurrently."""
-        results = []
-        errors = []
+    @pytest.mark.asyncio
+    async def test_concurrent_session_creation(self, manager):
+        """Multiple coroutines can create session configs concurrently."""
 
-        def create_session(session_id):
-            try:
-                manager.set_session_config(session_id, allowed_tools=["Bash"])
-                results.append(session_id)
-            except Exception as e:
-                errors.append(str(e))
+        async def create_session(session_id):
+            await manager.set_session_config(session_id, allowed_tools=["Bash"])
 
-        threads = []
-        for i in range(20):
-            t = threading.Thread(target=create_session, args=(f"session-{i}",))
-            threads.append(t)
-            t.start()
+        tasks = [create_session(f"session-{i}") for i in range(20)]
+        await asyncio.gather(*tasks)
 
-        for t in threads:
-            t.join()
-
-        assert len(errors) == 0
-        assert len(results) == 20
         assert len(manager.session_configs) == 20
 
-    def test_concurrent_config_updates(self, manager):
-        """Multiple threads can update global config concurrently."""
-        errors = []
+    @pytest.mark.asyncio
+    async def test_concurrent_config_updates(self, manager):
+        """Multiple coroutines can update global config concurrently."""
 
-        def update_config(tool_name):
-            try:
-                manager.update_global_config(allowed_tools=[tool_name])
-            except Exception as e:
-                errors.append(str(e))
+        async def update_config(tool_name):
+            await manager.update_global_config(allowed_tools=[tool_name])
 
-        threads = []
         tools = ["Bash", "Read", "Write", "Edit", "Glob"]
-        for tool in tools:
-            t = threading.Thread(target=update_config, args=(tool,))
-            threads.append(t)
-            t.start()
+        tasks = [update_config(tool) for tool in tools]
+        await asyncio.gather(*tasks)
 
-        for t in threads:
-            t.join()
-
-        assert len(errors) == 0
         # One of the tools should be set (last one to update wins)
         assert manager.global_config.allowed_tools is not None
 

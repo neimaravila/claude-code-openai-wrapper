@@ -1,4 +1,4 @@
-from typing import List, Optional, Dict, Any, Union, Literal
+from typing import ClassVar, List, Optional, Dict, Any, Union, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 from datetime import datetime
 import json
@@ -92,8 +92,24 @@ class ChatCompletionRequest(BaseModel):
     logit_bias: Optional[Dict[str, float]] = None
     user: Optional[str] = None
     session_id: Optional[str] = Field(
-        default=None, description="Optional session ID for conversation continuity"
+        default=None,
+        description="Optional session ID for conversation continuity",
+        max_length=128,
     )
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, v):
+        """Validate session ID format to prevent abuse."""
+        if v is not None:
+            import re
+
+            if not re.match(r"^[a-zA-Z0-9_\-]+$", v):
+                raise ValueError(
+                    "session_id must contain only alphanumeric characters, hyphens, and underscores"
+                )
+        return v
+
     enable_tools: Optional[bool] = Field(
         default=False,
         description="Enable Claude Code tools (Read, Write, Bash, etc.) - disabled by default for OpenAI compatibility",
@@ -449,15 +465,37 @@ class MCPServerConfigRequest(BaseModel):
             )
         return v.strip()
 
+    # Allowlist of permitted MCP server commands to prevent arbitrary command execution
+    ALLOWED_MCP_COMMANDS: ClassVar[set] = {
+        "npx",
+        "node",
+        "python",
+        "python3",
+        "uvx",
+        "docker",
+        "deno",
+        "bun",
+    }
+
     @field_validator("command")
     @classmethod
     def validate_command(cls, v: str) -> str:
-        """Validate MCP server command."""
+        """Validate MCP server command against allowlist."""
         if not v or not v.strip():
             raise ValueError("Command cannot be empty")
         if len(v) > 500:
             raise ValueError("Command path too long (max 500 characters)")
-        return v.strip()
+        v = v.strip()
+        # Extract the base command name (handle full paths like /usr/bin/node)
+        import os
+
+        base_command = os.path.basename(v)
+        if base_command not in cls.ALLOWED_MCP_COMMANDS:
+            raise ValueError(
+                f"Command '{base_command}' is not allowed. "
+                f"Permitted commands: {', '.join(sorted(cls.ALLOWED_MCP_COMMANDS))}"
+            )
+        return v
 
 
 class MCPServerInfoResponse(BaseModel):

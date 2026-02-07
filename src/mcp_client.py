@@ -5,11 +5,11 @@ Provides functionality to discover, connect to, and interact with MCP servers
 that expose tools, resources, and prompts.
 """
 
+import asyncio
 import logging
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field
 from datetime import datetime
-from threading import Lock
 
 try:
     from mcp import ClientSession, StdioServerParameters
@@ -60,37 +60,37 @@ class MCPClient:
 
         self.servers: Dict[str, MCPServerConfig] = {}
         self.connections: Dict[str, MCPServerConnection] = {}
-        self.lock = Lock()
+        self.lock = asyncio.Lock()
 
     def is_available(self) -> bool:
         """Check if MCP SDK is available."""
         return MCP_AVAILABLE
 
-    def register_server(self, config: MCPServerConfig) -> None:
+    async def register_server(self, config: MCPServerConfig) -> None:
         """Register an MCP server configuration."""
-        with self.lock:
+        async with self.lock:
             if config.name in self.servers:
                 logger.warning(f"Overwriting existing MCP server configuration: {config.name}")
             self.servers[config.name] = config
             logger.info(f"Registered MCP server: {config.name}")
 
-    def unregister_server(self, name: str) -> bool:
+    async def unregister_server(self, name: str) -> bool:
         """Unregister an MCP server."""
-        with self.lock:
+        async with self.lock:
             if name in self.servers:
                 del self.servers[name]
                 logger.info(f"Unregistered MCP server: {name}")
                 return True
             return False
 
-    def list_servers(self) -> List[MCPServerConfig]:
+    async def list_servers(self) -> List[MCPServerConfig]:
         """List all registered MCP servers."""
-        with self.lock:
+        async with self.lock:
             return list(self.servers.values())
 
-    def get_server(self, name: str) -> Optional[MCPServerConfig]:
+    async def get_server(self, name: str) -> Optional[MCPServerConfig]:
         """Get a specific server configuration."""
-        with self.lock:
+        async with self.lock:
             return self.servers.get(name)
 
     async def connect_server(self, name: str) -> bool:
@@ -103,7 +103,7 @@ class MCPClient:
             logger.error("Cannot connect to MCP server: MCP SDK not available")
             return False
 
-        config = self.get_server(name)
+        config = await self.get_server(name)
         if not config:
             logger.error(f"MCP server not found: {name}")
             return False
@@ -112,10 +112,11 @@ class MCPClient:
             logger.warning(f"MCP server is disabled: {name}")
             return False
 
-        # Check if already connected
-        if name in self.connections:
-            logger.info(f"Already connected to MCP server: {name}")
-            return True
+        # Check if already connected (inside lock to prevent TOCTOU race)
+        async with self.lock:
+            if name in self.connections:
+                logger.info(f"Already connected to MCP server: {name}")
+                return True
 
         try:
             # Create server parameters
@@ -194,7 +195,7 @@ class MCPClient:
                 available_prompts=available_prompts,
             )
 
-            with self.lock:
+            async with self.lock:
                 self.connections[name] = connection
 
             logger.info(
@@ -227,7 +228,7 @@ class MCPClient:
 
     async def disconnect_server(self, name: str) -> bool:
         """Disconnect from an MCP server."""
-        with self.lock:
+        async with self.lock:
             if name not in self.connections:
                 logger.warning(f"Not connected to MCP server: {name}")
                 return False
@@ -244,14 +245,14 @@ class MCPClient:
             logger.exception(f"Unexpected error disconnecting from MCP server '{name}': {e}")
             return False
 
-    def list_connected_servers(self) -> List[str]:
+    async def list_connected_servers(self) -> List[str]:
         """List names of currently connected servers."""
-        with self.lock:
+        async with self.lock:
             return list(self.connections.keys())
 
-    def get_connection(self, name: str) -> Optional[MCPServerConnection]:
+    async def get_connection(self, name: str) -> Optional[MCPServerConnection]:
         """Get an active server connection."""
-        with self.lock:
+        async with self.lock:
             return self.connections.get(name)
 
     async def call_tool(self, server_name: str, tool_name: str, arguments: Dict[str, Any]) -> Any:
@@ -266,7 +267,7 @@ class MCPClient:
         Returns:
             Tool response
         """
-        connection = self.get_connection(server_name)
+        connection = await self.get_connection(server_name)
         if not connection:
             raise ValueError(f"Not connected to MCP server: {server_name}")
 
@@ -288,7 +289,7 @@ class MCPClient:
         Returns:
             Resource content
         """
-        connection = self.get_connection(server_name)
+        connection = await self.get_connection(server_name)
         if not connection:
             raise ValueError(f"Not connected to MCP server: {server_name}")
 
@@ -313,7 +314,7 @@ class MCPClient:
         Returns:
             Prompt content
         """
-        connection = self.get_connection(server_name)
+        connection = await self.get_connection(server_name)
         if not connection:
             raise ValueError(f"Not connected to MCP server: {server_name}")
 
@@ -324,20 +325,20 @@ class MCPClient:
             logger.error(f"Error getting prompt '{prompt_name}' from server '{server_name}': {e}")
             raise
 
-    def get_all_tools(self) -> Dict[str, List[Dict[str, Any]]]:
+    async def get_all_tools(self) -> Dict[str, List[Dict[str, Any]]]:
         """
         Get all available tools from all connected MCP servers.
 
         Returns dict mapping server name to list of tools.
         """
-        with self.lock:
+        async with self.lock:
             return {
                 name: connection.available_tools for name, connection in self.connections.items()
             }
 
-    def get_stats(self) -> Dict[str, Any]:
+    async def get_stats(self) -> Dict[str, Any]:
         """Get statistics about MCP connections."""
-        with self.lock:
+        async with self.lock:
             total_tools = sum(len(conn.available_tools) for conn in self.connections.values())
             total_resources = sum(
                 len(conn.available_resources) for conn in self.connections.values()
